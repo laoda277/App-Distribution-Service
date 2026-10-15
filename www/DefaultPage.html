@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>epoll-httpd · C++ 高性能 HTTP/1.1 服务器</title>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+
+<nav class="nav">
+  <div class="nav-inner">
+    <a class="brand" href="/">
+      <svg width="20" height="20" viewBox="0 0 32 32" aria-hidden="true">
+        <rect x="5" y="6" width="22" height="5" rx="1" fill="#1b1a18"/>
+        <rect x="5" y="13.5" width="22" height="5" rx="1" fill="#9e3b21"/>
+        <rect x="5" y="21" width="22" height="5" rx="1" fill="#d1c9be"/>
+      </svg>
+      <span>epoll-httpd</span>
+    </a>
+    <div class="nav-links">
+      <a href="/" class="on">首页</a>
+      <a href="/about">项目详情</a>
+      <a href="/api/status">状态接口</a>
+    </div>
+  </div>
+</nav>
+
+<main class="wrap">
+
+  <header class="hero">
+    <div class="badge"><i></i>C++17 · Linux · 单 Reactor 多线程</div>
+    <h1>基于 epoll 的高性能 HTTP/1.1 服务器</h1>
+    <p class="hero-sub">
+      边缘触发 + EPOLLONESHOT 的事件驱动模型，线程池执行请求，LRU 缓存加速静态文件，
+      支持长连接、条件请求与运行时统计。<strong>从 socket、epoll 到 HTTP 报文解析全部手写，不依赖任何第三方网络库。</strong>
+    </p>
+    <div class="tags">
+      <span class="tag">epoll ET</span>
+      <span class="tag">EPOLLONESHOT</span>
+      <span class="tag">线程池</span>
+      <span class="tag">keep-alive</span>
+      <span class="tag">LRU FileCache</span>
+      <span class="tag">条件请求 304</span>
+      <span class="tag">半发送处理</span>
+      <span class="tag">优雅退出</span>
+    </div>
+    <div class="hero-actions">
+      <a class="btn btn-primary" href="/about">项目详情 →</a>
+      <a class="btn" href="/api/status">/api/status</a>
+    </div>
+  </header>
+
+  <!-- ============ 实时状态：数据来自服务器的 /api/status 接口 ============ -->
+  <section>
+    <div class="card">
+      <div class="live-head">
+        <h2>运行状态</h2>
+        <div class="live-tag" id="live-tag">
+          <span class="pulse"></span>
+          <span id="live-text">LIVE</span>
+        </div>
+      </div>
+
+      <div class="stats">
+        <div class="stat">
+          <div class="stat-k">运行时长</div>
+          <div class="stat-v sm num" id="s-uptime">—</div>
+        </div>
+        <div class="stat">
+          <div class="stat-k">累计请求</div>
+          <div class="stat-v num" id="s-total">—</div>
+        </div>
+        <div class="stat">
+          <div class="stat-k">缓存命中</div>
+          <div class="stat-v num" id="s-hits">—</div>
+        </div>
+        <div class="stat">
+          <div class="stat-k">缓存未命中</div>
+          <div class="stat-v num" id="s-misses">—</div>
+        </div>
+        <div class="stat">
+          <div class="stat-k">命中率</div>
+          <div class="stat-v num" id="s-rate">—</div>
+          <div class="stat-note" id="s-inflight"></div>
+        </div>
+      </div>
+
+      <div class="live-foot">
+        <span id="live-updated">正在连接 /api/status …</span>
+        <button type="button" id="live-refresh">立即刷新</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ 压测数据：全部取自项目内 BENCHMARK.md ============ -->
+  <section>
+    <div class="sec-head">
+      <h2>性能基准</h2>
+      <span class="hint">V1 → V7 版本阶梯 · 32×25 混合并发 · 2 核虚拟机</span>
+    </div>
+    <div class="perf">
+      <div class="perf-item">
+        <div class="perf-v num">33,546<em></em></div>
+        <div class="perf-k">混合长连接 QPS</div>
+        <div class="perf-note">口径 A · 3 轮中值</div>
+      </div>
+      <div class="perf-item">
+        <div class="perf-v num">0.413<em>ms</em></div>
+        <div class="perf-k">P99 延迟</div>
+        <div class="perf-note">早期版本最差 1227 ms</div>
+      </div>
+      <div class="perf-item">
+        <div class="perf-v num">29.8<em>s → 0.24ms</em></div>
+        <div class="perf-k">空闲连接下的请求延迟</div>
+        <div class="perf-note">阻塞模型 → Reactor 模型</div>
+      </div>
+      <div class="perf-item">
+        <div class="perf-v num">0<em>/ 800</em></div>
+        <div class="perf-k">压测失败请求</div>
+        <div class="perf-note">竞态修复前最差 108 / 800</div>
+      </div>
+    </div>
+    <p class="footnote">
+      数据取自项目内 <code>BENCHMARK.md</code>。口径 A 的测量窗口约 0.03 s，绝对值系统偏低、版本间相对差异有效；
+      放大窗口至 0.7 s 后（口径 B），最终版混合长连接 QPS 为 4.7 万+（5 轮中值，CV 4.2%）。
+    </p>
+  </section>
+
+  <!-- ============ 核心实现 ============ -->
+  <section>
+    <div class="sec-head">
+      <h2>核心实现</h2>
+      <span class="hint">从事件循环到响应落地的六处关键设计</span>
+    </div>
+    <div class="features">
+
+      <div class="feat">
+        <h3>边缘触发 + EPOLLONESHOT</h3>
+        <p>同一 fd 在任意时刻最多被一个 worker 处理。修复了 LT 模式下重复派发引发的 fd 竞态 —— 该缺陷曾造成 5%~35% 的连接被 RST。</p>
+      </div>
+
+      <div class="feat">
+        <h3>单 Reactor 多线程</h3>
+        <p>主线程只做 accept 与事件派发，请求交给线程池。空闲长连接不再占用 worker —— 阻塞模型下仅 3 条空闲连接就会把新请求拖延 29.8 秒。</p>
+      </div>
+
+      <div class="feat">
+        <h3>HTTP/1.1 长连接</h3>
+        <p>连接内循环解析，按 <code>\r\n\r\n</code> 切分处理粘包与半包，空闲 30 秒自动回收。混合并发场景 QPS 提升 23%，配合事件驱动模型才不会反噬并发能力。</p>
+      </div>
+
+      <div class="feat">
+        <h3>LRU 文件缓存</h3>
+        <p><code>shared_ptr</code> 共享正文、<code>mutex</code> 保护映射表，字节上限触发 LRU 淘汰。TTL 窗口内跳过 <code>stat</code>，命中路径零系统调用；窗口到期后按纳秒精度比对 mtime。</p>
+      </div>
+
+      <div class="feat">
+        <h3>条件请求 304</h3>
+        <p>响应回 <code>Last-Modified</code>，请求读 <code>If-Modified-Since</code>；命中时只回一个响应头，正文一个字节都不发。头字段名大小写不敏感，值两侧的空白按 RFC 7230 剥离。</p>
+      </div>
+
+      <div class="feat">
+        <h3>运行时统计</h3>
+        <p>原子计数累计请求、缓存命中与未命中，未命中在返回空结果的同一路径上完成累加。<code>/api/status</code> 输出 JSON —— 本页顶部的实时面板就是它在供数。</p>
+      </div>
+
+    </div>
+  </section>
+
+</main>
+
+<footer class="foot">
+  <div class="foot-inner">
+    <div>
+      epoll + 线程池 · C++17 · 手写实现，无第三方依赖<br>
+      <code>g++ -Wall -O2 -pthread -std=c++17</code>
+    </div>
+    <div>
+      版本 <code>V7</code> · 7 个版本 tag<br>
+      <a href="/about">项目详情 →</a>
+    </div>
+  </div>
+</footer>
+
+<script src="/app.js"></script>
+
+</body>
+</html>

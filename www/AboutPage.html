@@ -1,0 +1,335 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>项目详情 · epoll-httpd</title>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+
+<nav class="nav">
+  <div class="nav-inner">
+    <a class="brand" href="/">
+      <svg width="20" height="20" viewBox="0 0 32 32" aria-hidden="true">
+        <rect x="5" y="6" width="22" height="5" rx="1" fill="#1b1a18"/>
+        <rect x="5" y="13.5" width="22" height="5" rx="1" fill="#9e3b21"/>
+        <rect x="5" y="21" width="22" height="5" rx="1" fill="#d1c9be"/>
+      </svg>
+      <span>epoll-httpd</span>
+    </a>
+    <div class="nav-links">
+      <a href="/">首页</a>
+      <a href="/about" class="on">项目详情</a>
+      <a href="/api/status">状态接口</a>
+    </div>
+  </div>
+</nav>
+
+<main class="wrap">
+
+  <header class="hero">
+    <div class="badge"><i></i>项目详情</div>
+    <h1>单 Reactor 多线程 + 边缘触发的事件驱动服务器</h1>
+    <p class="hero-sub">
+      从每连接一线程的阻塞模型出发，经七个版本迭代到单 Reactor 多线程 +
+      边缘触发 + EPOLLONESHOT 的事件驱动架构。下面记录架构、链路、压测数据，
+      以及过程中定位到的六个真实问题。
+    </p>
+  </header>
+
+  <!-- ============ 架构 ============ -->
+  <section>
+    <div class="sec-head">
+      <h2>架构</h2>
+      <span class="hint">单 Reactor 多线程</span>
+    </div>
+    <div class="card">
+      <p style="color:var(--ink-2);margin-bottom:20px">
+        一个 <code>epoll</code> 实例同时管理监听 fd 与全部连接 fd。主线程只负责事件收集与任务分发，
+        不做任何请求处理；worker 线程从任务队列取 fd，完成读写与响应构造后重新武装该 fd。
+        <strong style="color:var(--ink)">线程不绑定连接</strong> —— 这是与 V4 之前阻塞模型的根本差别。
+      </p>
+      <ul class="steps">
+        <li>
+          <b>主线程 · 事件循环</b>
+          <p><code>epoll_wait</code> 收集就绪事件。监听 fd 就绪时进入非阻塞 <code>accept</code> 循环一次性收割全部新连接；连接 fd 就绪时把 fd 封装为任务投入队列。主线程自身从不阻塞在 socket IO 上。</p>
+        </li>
+        <li>
+          <b>线程池 · 请求处理</b>
+          <p>worker 被唤醒后取出 fd，完成读取、解析、路由、响应构造与发送。工作期间该 fd 处于「已摘除」状态，不会再次被派发。</p>
+        </li>
+        <li>
+          <b>EPOLLONESHOT · 互斥保护</b>
+          <p>每个连接 fd 注册时携带 <code>EPOLLONESHOT</code>，事件上报一次后自动失效；worker 收尾时用 <code>EPOLL_CTL_MOD</code> 重新武装。这保证同一 fd 在任意时刻最多只有一个 worker 在操作。</p>
+        </li>
+        <li>
+          <b>资源回收</b>
+          <p>空闲超过 30 秒的连接由定时清理回收；客户端声明 <code>Connection: close</code> 或 HTTP/1.0 且未显式要求长连接时，响应完毕后关闭。</p>
+        </li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- ============ 请求链路 ============ -->
+  <section>
+    <div class="sec-head">
+      <h2>一次请求的完整链路</h2>
+      <span class="hint">从 epoll_wait 到字节落网</span>
+    </div>
+    <div class="card">
+      <ul class="steps">
+        <li>
+          <b>事件上报</b>
+          <p><code>epoll_wait</code> 返回就绪的 fd 列表与事件掩码。</p>
+        </li>
+        <li>
+          <b>分支判定</b>
+          <p>fd 等于监听 fd → 走 accept 分支；否则是已建立连接的读/写事件 → 走任务派发分支。</p>
+        </li>
+        <li>
+          <b>读取与分包</b>
+          <p>循环 <code>recv</code> 直到 <code>EAGAIN</code>，把数据追加进连接缓冲区。按 <code>\r\n\r\n</code> 切分出完整请求 —— 一次读取可能包含多个请求，也可能只有一个请求的前半段。</p>
+        </li>
+        <li>
+          <b>解析与路由</b>
+          <p>提取请求行的方法与路径、HTTP 版本、<code>Connection</code> 与 <code>If-Modified-Since</code> 头。路径先经 <code>realpath</code> 解析并校验前缀，防止目录穿越。随后进入路由：<code>/</code>、<code>/about</code>、<code>/api/status</code> 或静态文件。</p>
+        </li>
+        <li>
+          <b>取内容</b>
+          <p>静态文件先查 <code>FileCache</code>：命中则直接拿到内存中的 <code>shared_ptr&lt;const string&gt;</code>；未命中则读盘、入库，并把磁盘 mtime 一起带出，供条件请求比对。</p>
+        </li>
+        <li>
+          <b>协商</b>
+          <p>把客户端带来的 <code>If-Modified-Since</code> 与本次实际要返回的正文版本比对。一致则构造 304 响应 —— 不含 <code>Content-Type</code>、<code>Content-Length</code> 与正文。</p>
+        </li>
+        <li>
+          <b>发送</b>
+          <p>拼接响应头与正文，进入 <code>send</code> 循环。若一次未写完，把该 fd 的写事件加入 epoll 监听，可写时继续续发，直到全部落网。</p>
+        </li>
+        <li>
+          <b>重武装或关闭</b>
+          <p>以 <code>EPOLL_CTL_MOD</code> 恢复该 fd 的读事件监听进入下一轮请求；若需关闭则从 epoll 摘除并释放连接资源。任一环节的发送失败都会逐层上报到连接去留决策处。</p>
+        </li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- ============ 关键实现 ============ -->
+  <section>
+    <div class="sec-head">
+      <h2>关键实现</h2>
+      <span class="hint">每一条都对应一个具体问题</span>
+    </div>
+    <div class="tbl-wrap">
+      <table>
+        <thead>
+          <tr><th>机制</th><th>做法</th><th>解决什么问题</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>边缘触发</td>
+            <td>监听与连接 fd 均注册 <code>EPOLLET</code>，读取循环到 <code>EAGAIN</code> 为止</td>
+            <td>避免水平触发下同一批数据反复唤醒事件循环</td>
+          </tr>
+          <tr>
+            <td>EPOLLONESHOT</td>
+            <td>事件上报后自动失效，处理收尾时 <code>MOD</code> 重武装</td>
+            <td>同一 fd 被并发派发给两个 worker，导致 double close 或误关已复用的 fd</td>
+          </tr>
+          <tr>
+            <td>线程池</td>
+            <td><code>mutex</code> + <code>condition_variable</code> + 任务队列</td>
+            <td>主线程阻塞在 IO 上，并发容量被空闲连接侵蚀</td>
+          </tr>
+          <tr>
+            <td>粘包与半包</td>
+            <td>缓冲区按 <code>\r\n\r\n</code> 切分，未成帧的数据留在缓冲区内等下一次读取</td>
+            <td>一次 <code>recv</code> 可能拿到多个请求或不完整的请求</td>
+          </tr>
+          <tr>
+            <td>缓存共享</td>
+            <td>正文以 <code>shared_ptr&lt;const string&gt;</code> 返回，映射表由 <code>mutex</code> 保护</td>
+            <td>一个线程淘汰条目时，另一个线程手上的内容仍然有效</td>
+          </tr>
+          <tr>
+            <td>TTL 校验</td>
+            <td>2 秒窗口内跳过 <code>stat</code>；窗口到期后按纳秒精度比对 mtime</td>
+            <td>命中路径上的系统调用 —— 让「缓存命中」真正省掉 IO</td>
+          </tr>
+          <tr>
+            <td>条件请求</td>
+            <td>回 <code>Last-Modified</code>，读 <code>If-Modified-Since</code>，命中回 304</td>
+            <td>重复访问同一静态资源时的整份正文传输</td>
+          </tr>
+          <tr>
+            <td>半发送处理</td>
+            <td><code>send</code> 部分写入时记录偏移，注册 <code>EPOLLOUT</code> 续发</td>
+            <td>响应体大于内核发送缓冲区时空闲丢弃已写数据</td>
+          </tr>
+          <tr>
+            <td>路径安全</td>
+            <td><code>realpath</code> 规范化后校验是否位于站点根目录内</td>
+            <td>形如 <code>/../../etc/passwd</code> 的目录穿越请求</td>
+          </tr>
+          <tr>
+            <td>优雅退出</td>
+            <td>捕获终止信号后停止 accept，等待在途请求结束再退出</td>
+            <td>退出瞬间留下半截响应</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- ============ 压测 ============ -->
+  <section>
+    <div class="sec-head">
+      <h2>版本阶梯与压测数据</h2>
+      <span class="hint">32×25 混合并发 · 2 核虚拟机 · 回环网络</span>
+    </div>
+    <div class="tbl-wrap">
+      <table>
+        <thead>
+          <tr><th>版本</th><th>主要改动</th><th>混合 QPS</th><th>P99</th><th>稳定性</th></tr>
+        </thead>
+        <tbody>
+          <tr><td class="n">V1</td><td>阻塞 accept + 每连接一线程</td><td class="n">773</td><td class="n">4.3 ms</td><td><span class="bad">最差 1227 ms</span></td></tr>
+          <tr><td class="n">V2</td><td>引入线程池组件（未接入主循环）</td><td class="n">746</td><td class="n">1033 ms</td><td><span class="bad">差</span></td></tr>
+          <tr><td class="n">V3</td><td>epoll 管理监听 fd + 线程池接入</td><td class="n">13,988</td><td class="n">3.87 ms</td><td><span class="mid">稳定</span></td></tr>
+          <tr><td class="n">V4</td><td>keep-alive 长连接</td><td class="n">17,247</td><td class="n">21.5 ms</td><td><span class="mid">P99 恶化</span></td></tr>
+          <tr><td class="n">V5</td><td>完整 Reactor 事件驱动</td><td class="n">14,863</td><td class="n">2.23 ms</td><td><span class="bad">短连接 RST</span></td></tr>
+          <tr><td class="n">V5 正式</td><td>EPOLLONESHOT 竞态修复 + close 语义</td><td class="n">33,546</td><td class="n">0.413 ms</td><td><span class="good">失败 0</span></td></tr>
+          <tr><td class="n">V6</td><td>LRU 文件缓存</td><td class="n">30,967</td><td class="n">0.530 ms</td><td><span class="good">失败 0</span></td></tr>
+          <tr><td class="n">V7</td><td>语义修正（mtime 精度 / 连接默认值 / 头字段）</td><td class="n">25,199</td><td class="n">0.959 ms</td><td><span class="good">失败 0</span></td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="footnote">
+      口径 A：32 个并发连接 × 25 个请求，测量窗口约 0.03 s。该窗口与线程创建、连接建立等固定开销同量级，
+      <strong>绝对值系统偏低</strong>，版本间的相对变化仍有效。V6 与 V7 之间的差异经放大窗口复测后判定为噪声
+      （<code>b3e2566</code> 46,253 vs <code>d8dea60</code> 46,958，5 轮区间大幅重叠）。
+      压测客户端为自研 Python socket 多线程脚本，全程同一客户端，纵向对比。
+    </p>
+  </section>
+
+  <!-- ============ 关键发现 ============ -->
+  <section>
+    <div class="sec-head">
+      <h2>过程中定位到的六个问题</h2>
+      <span class="hint">定位 → 量化 → 修复 → 复测</span>
+    </div>
+    <div class="tbl-wrap">
+      <table>
+        <thead>
+          <tr><th>#</th><th>现象</th><th>根因</th><th>处置</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td class="n">1</td>
+            <td>V1/V2 突发下约 1 秒长尾</td>
+            <td>阻塞 accept 每次只取一个连接，backlog 溢出触发客户端 SYN 重传</td>
+            <td>改 epoll + 非阻塞 accept 循环收割，长尾消失</td>
+          </tr>
+          <tr>
+            <td class="n">2</td>
+            <td>2 条空闲长连接占满 2 个 worker，第 3 条请求延迟 <strong>29.8 s</strong></td>
+            <td>epoll 只管监听 fd，已接入连接仍由 worker 阻塞式 <code>recv</code> 独占线程</td>
+            <td>V5 改为按事件分发而非按连接占用线程，延迟降到 <strong>0.24 ms</strong></td>
+          </tr>
+          <tr>
+            <td class="n">3</td>
+            <td>keep-alive 让混合 QPS +23%，P99 却恶化到 21.5 ms</td>
+            <td>空闲连接直接侵蚀并发容量</td>
+            <td>结论：keep-alive 必须与事件驱动模型配合，否则得不偿失</td>
+          </tr>
+          <tr>
+            <td class="n">4</td>
+            <td>短连接压测中 <strong>5%~35%</strong> 的连接被 RST，而服务器日志毫无异常</td>
+            <td>LT 模式下 worker 尚未 <code>recv</code> 时 epoll 重复上报同一 fd，主线程派发第二个 worker → double close 或误关已复用的 fd</td>
+            <td>注册 <code>EPOLLONESHOT</code>，失败率从 108/800 归零</td>
+          </tr>
+          <tr>
+            <td class="n">5</td>
+            <td>引入 LRU 缓存后 QPS 测不出提升</td>
+            <td>923 B 文件预热后完全命中内核页缓存，<code>read()</code> 已接近内存拷贝，缓存只省下一次 <code>open</code> + <code>read</code></td>
+            <td>结论：缓存的价值在大文件与磁盘 IO 竞争场景，当前口径覆盖不到 —— <strong>测不出并解释清楚原因，好过编一个数字</strong></td>
+          </tr>
+          <tr>
+            <td class="n">6</td>
+            <td>曾判定 V7 比 V6 下降 19%（两组 6 轮区间不重叠）</td>
+            <td>口径 A 测量窗口仅 0.03 s，调度抖动足以制造 20% 以上偏差；后经同代码对照发现噪声本底就有 5.7%</td>
+            <td>放大窗口至 0.7 s 后复测，差异消失，<strong>原结论证伪</strong></td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="footnote">
+      第 4 与第 6 条是这批改动里最有价值的部分：前者说明「失败率本身就是指标」—— 给压测客户端加上 RST 统计后，
+      偶发竞态变成了可量化、可复现、可验证归零的数据；后者说明测量窗口必须显著长于被测系统的时间尺度，
+      且判定版本差异需要一个同代码对照来量化噪声本底。
+    </p>
+  </section>
+
+  <!-- ============ 版本演进 ============ -->
+  <section>
+    <div class="sec-head">
+      <h2>版本演进</h2>
+      <span class="hint">每个版本一个 git tag，可独立检出复现</span>
+    </div>
+    <div class="card">
+      <ul class="tl">
+        <li><span class="v">V1</span><div><b>阻塞 accept + 每连接一线程</b><p>基线实现，响应 <code>Connection: close</code>。</p></div></li>
+        <li><span class="v">V2</span><div><b>线程池组件</b><p>完成 <code>ThreadPool</code> 类，尚未接入主循环。</p></div></li>
+        <li><span class="v">V3</span><div><b>epoll 管理监听 fd</b><p>非阻塞 accept 循环一次性收割全部连接，线程池正式接入。混合 QPS 较 V1 提升约 18 倍。</p></div></li>
+        <li><span class="v">V4</span><div><b>keep-alive 长连接</b><p>连接内循环解析，支持粘包与半包；空闲 30 秒回收。</p></div></li>
+        <li><span class="v">V5</span><div><b>完整 Reactor 事件驱动</b><p>epoll 同时管理监听与连接 fd，空闲连接不再占用线程；EPOLLONESHOT 修复重复派发竞态。</p></div></li>
+        <li><span class="v">V6</span><div><b>LRU 文件缓存</b><p>字节上限触发 LRU 淘汰，命中直接返回内存内容。</p></div></li>
+        <li><span class="v">V7</span><div><b>语义修正</b><p>缓存 mtime 升至纳秒精度、区分 HTTP/1.0 与 1.1 的默认连接方式、头字段名大小写不敏感、发送失败逐层上报。</p></div></li>
+        <li><span class="v">当前</span><div><b>运行时统计与条件请求</b><p>新增 <code>/api/status</code> 原子计数接口；缓存改为定期校验，命中路径零系统调用；实现 <code>Last-Modified</code> / <code>If-Modified-Since</code> 协商缓存返回 304。</p></div></li>
+      </ul>
+    </div>
+  </section>
+
+  <section>
+    <div class="sec-head"><h2>自行验证</h2></div>
+    <div class="code">
+      <div class="code-bar"><span></span><span></span><span></span><b>bash</b></div>
+<pre><span class="c"># 以下命令需在部署本服务器的机器上执行（默认监听 :8080）</span>
+H=http://localhost:8080
+
+<span class="c"># 条件请求：第二次询问只回响应头，正文 0 字节</span>
+<span class="c"># 期望输出：status=304  bytes=0</span>
+LM=$(curl -s -D - -o /dev/null $H/style.css | awk -F': ' <span class="k">'tolower($1)=="last-modified"{print $2}'</span> | tr -d '\r')
+curl -o /dev/null -w 'status=%{http_code}  bytes=%{size_download}\n' \
+     -H "If-Modified-Since: $LM" $H/style.css
+
+<span class="c"># 长连接：同一条连接上连续两个请求，第二次复用已建立的连接</span>
+<span class="c"># 期望输出：Re-using existing connection!</span>
+curl -sv $H/ $H/api/status 2>&1 | grep -E 'Re-using|Connected'
+
+<span class="c"># 运行时统计接口</span>
+curl -s $H/api/status
+
+<span class="c"># 压测脚本（仓库根目录执行）</span>
+python3 bench/bench.py</pre>
+    </div>
+  </section>
+
+</main>
+
+<footer class="foot">
+  <div class="foot-inner">
+    <div>
+      epoll + 线程池 · C++17 · 手写实现，无第三方依赖<br>
+      <code>g++ -Wall -O2 -pthread -std=c++17</code>
+    </div>
+    <div>
+      <a href="/">← 返回首页</a>
+    </div>
+  </div>
+</footer>
+
+</body>
+</html>
