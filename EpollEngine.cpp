@@ -14,6 +14,8 @@
 #include <sys/eventfd.h>
 #include <cstdint>      
 #include <sys/epoll.h>  
+#include <utility>
+
 
 
 EpollEngine::EpollEngine()
@@ -139,7 +141,9 @@ void EpollEngine::sigHandle(int sig){
     }
 }
 
-bool EpollEngine::init(int port, int backlog){
+bool EpollEngine::init(int port, int backlog, ClientHandler onAccept){
+    onAccept_ = std::move(onAccept);
+    
     cleanup();
 
     if(!createListeningSocket(port, backlog)){
@@ -204,7 +208,12 @@ bool EpollEngine::run(const ConnHandler& onConnWorking, const TickHandler& onTic
                     std::cerr<<"接受连接失败"<<std::endl;
                     break;
                 }
-                addConnection(clientSocket);
+                if(onAccept_){
+                    onAccept_(clientSocket);
+                }
+                else{
+                    addConnection(clientSocket);
+                }
             }
         }
         else if(events[i].data.fd == wakeupFd_){
@@ -224,6 +233,11 @@ bool EpollEngine::run(const ConnHandler& onConnWorking, const TickHandler& onTic
     return true;
 
 }
+
+int EpollEngine::epollFd() const {
+    return epollFd_;
+}
+
 
 bool EpollEngine::stop() {
     running_ = false;

@@ -19,6 +19,13 @@
 #include <vector>
 #include <mutex>
 #include "HTTPServer.h"
+   static epoll_event makeEvent(int fd, uint32_t events){
+    epoll_event ev{};
+    ev.events = events | EPOLLONESHOT;
+    ev.data.fd = fd;
+    return ev;
+   }
+
    HTTPServer::ReadStatus HTTPServer::readRequest(int clientSocket,std::string& connBuffer, std::string& request){ //将缓冲区内容写到request中 返回值表示读的状态
        const size_t kMaxTotal = 8192;
        char chunk[4096];
@@ -161,7 +168,7 @@
          return response.str();   // 到空行为止 没有 Content-Length 没有 Content-Type 没有正文
 }
       
-      bool HTTPServer::processRequest(int clientSocket, const std::string& request){  //处理请求
+      bool HTTPServer::processRequest(int clientSocket, const std::string& request){ 
          bool keep = !clientWantsClose(request); //表示是否还保持长连接
          std::string userPath = extractPath(request);  
          totalRequests_.fetch_add(1, std::memory_order_relaxed); //最宽松约束 无需关注顺序
@@ -187,7 +194,19 @@
                     << ",\"cache_hits\":"    << cacheHits_.load(std::memory_order_relaxed)
                     << ",\"cache_misses\":"   << cacheMisses_.load(std::memory_order_relaxed)
                     << ",\"in_flight\":"   << inFlight
-                    << "}";
+                    << ",\"connections_per_reactor\":[";
+                     for(size_t i = 0; i < subReactors_.size(); ++i)
+                     {
+                        if(i > 0)
+                        {
+                           body << ",";
+                        }
+
+                        body << subReactors_[i]->connectionCount();
+                     }
+
+                     body << "]}";
+
             
          std::string response = createResponse(body.str(), "application/json", 200, keep);
          bool alive = sendResponse(clientSocket, response);
@@ -236,6 +255,7 @@
             lastActive_[clientSocket] = std::chrono::steady_clock::now();
             inFlight_.insert(clientSocket);
          }
+         
 
          while(true){
             std::string request;
@@ -296,20 +316,54 @@
       }
 
 
-        void HTTPServer::finishOnce(int fd){
-         bool hasPending = false;
+      void HTTPServer::finishOnce(int fd)
          {
-            std::lock_guard<std::mutex> lk(connMutex_);
-            inFlight_.erase(fd);
-            hasPending = outBuffers_.count(fd) >0;
+            bool hasPending = false;
+            int epfd = -1;
+
+            {
+               std::lock_guard<std::mutex> lk(connMutex_);
+               inFlight_.erase(fd);
+
+               auto outIt = outBuffers_.find(fd);
+               if(outIt != outBuffers_.end() && !outIt->second.empty())
+               {
+                     hasPending = true;
+               }
+
+               auto epIt = fdEpoll_.find(fd);
+               if(epIt != fdEpoll_.end())
+               {
+                     epfd = epIt->second;
+               }
+            }
+
+            if(epfd >= 0)
+            {
+               armOn(epfd, fd, hasPending ? EPOLLOUT : EPOLLIN);
+            }
          }
-         epollEngine.armConnection(fd, hasPending? EPOLLOUT:EPOLLIN);
-        }
+
       
 
 
       void HTTPServer::closeConnection(int fd){
-         epollEngine.removeConnection(fd);
+         int epfd = -1;
+
+         {
+            std::lock_guard<std::mutex> lk(connMutex_);
+            auto it = fdEpoll_.find(fd);
+            if(it != fdEpoll_.end())
+            {
+                  epfd = it->second;
+                  fdEpoll_.erase(it);
+            }
+         }
+
+         if(epfd >= 0)
+         {
+            removeOn(epfd, fd);
+         }
          {
             std::lock_guard<std::mutex> lk(connMutex_);
             connBuffers_.erase(fd);
@@ -319,6 +373,7 @@
          }
          close(fd);
       }
+
 
       [[nodiscard]] bool HTTPServer::trySend(int fd, const char*& data, size_t& toSend){ //尝试进行发送
          while(toSend > 0){
@@ -366,8 +421,12 @@
          for(int fd: victims) closeConnection(fd);
       }
 
-      void HTTPServer::shutdownServer() {
-         if(shutDown_) return;
+      void HTTPServer::shutdownServer()
+      {
+         if(shutDown_)
+         {
+            return;
+         }
          shutDown_ = true;
 
          threadPool.drain();
@@ -375,15 +434,32 @@
          std::vector<int> fds;
          {
             std::lock_guard<std::mutex> lk(connMutex_);
-            fds.reserve(lastActive_.size());
-            for(const auto &[fd, t] : lastActive_){
-               fds.push_back(fd);
+            fds.reserve(fdEpoll_.size());
+
+            for(const auto& entry : fdEpoll_)  //选用fdepoll包括未发送请求和已发送请求的  若用lastActive则只有后者
+            {
+                  fds.push_back(entry.first);
             }
          }
-         for(int fd : fds){
+
+         for(int fd : fds)
+         {
             closeConnection(fd);
          }
+
+         for(auto& sr : subReactors_)
+         {
+            sr->stop();
+         }
+
+         for(auto& sr : subReactors_)
+         {
+            sr->join();
+         }
+
+         subReactors_.clear();
       }
+
 
       //存活状态由sendResponse上传到send404与500  
       bool HTTPServer::send404(int clientSocket, bool keepAlive){ //发送错误码并返回链接存活状态
@@ -443,6 +519,68 @@
             return buffer.str();    
       }
 
+      void HTTPServer::dispatchNewConnection(int clientFd)
+   {
+      if(subReactors_.empty())
+      {
+         close(clientFd);
+         return;
+      }
+
+      size_t idx = nextSub_.fetch_add(1, std::memory_order_relaxed) % subReactors_.size();
+      int targetEpfd = subReactors_[idx]->epollFd();
+
+      if(!subReactors_[idx]->addConnection(clientFd))
+      {
+         close(clientFd);
+         return;
+      }
+
+      {
+         std::lock_guard<std::mutex> lk(connMutex_);
+         fdEpoll_[clientFd] = targetEpfd;
+      }
+   }
+
+
+
+      void HTTPServer::dispatchReady(int fd, uint32_t events)
+         {
+            if(events & (EPOLLERR | EPOLLHUP))
+            {
+               closeConnection(fd);
+               return;
+            }
+
+            if(events & EPOLLOUT)
+            {
+               threadPool.enqueue([this, fd]()
+               {
+                     handleWritable(fd);
+               });
+            }
+            else
+            {
+               threadPool.enqueue([this, fd]()
+               {
+                     handleOnce(fd);
+               });
+            }
+         }
+
+      bool HTTPServer::armOn(int epfd, int fd, uint32_t events)
+         {
+            epoll_event ev = makeEvent(fd, events);
+            return epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &ev) == 0;
+         }
+
+      void HTTPServer::removeOn(int epfd, int fd)
+         {
+            epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
+         }
+
+
+
 
     HTTPServer::HTTPServer(int port) : 
                port(port), 
@@ -467,43 +605,54 @@
 
 
 
-    bool HTTPServer::start() {
-      if(!epollEngine.init(port, 128)||!initialized){
-         std::cerr<<"服务器初始化失败"<<std::endl;
+    bool HTTPServer::start()
+   {
+      for(size_t i = 0; i < kSubReactorCount; ++i)
+      {
+         auto sr = std::make_unique<SubReactor>();
+
+         bool reactorOk = sr->start([this](int fd, uint32_t ev)
+         {
+               dispatchReady(fd, ev);
+         });
+
+         if(!reactorOk)
+         {
+               std::cerr << "SubReactor " << i << " 启动失败" << std::endl;
+               return false;
+         }
+
+         subReactors_.push_back(std::move(sr));
+      }
+
+      bool initOk = epollEngine.init(port, 128, [this](int clientFd)
+      {
+         dispatchNewConnection(clientFd);
+      });
+
+      if(!initOk || !initialized)
+      {
+         std::cerr << "服务器初始化失败" << std::endl;
          return false;
       }
 
       running = true;
-      std::cout<<"服务器启动成功!"<<std::endl;
-      std::cout<<"访问地址:http://localhost:"<<port<<std::endl;
-      std::cout<<"按ctrl+c停止服务器"<<std::endl;
+      std::cout << "服务器启动成功!" << std::endl;
+      std::cout << "访问地址:http://localhost:" << port << std::endl;
+      std::cout << "按ctrl+c停止服务器" << std::endl;
 
-      bool ok = epollEngine.run([this] (int clientSocket, uint32_t events){
-         if(events & (EPOLLERR | EPOLLHUP)){
-            closeConnection(clientSocket);
-            return;
-         }
-         if(events & EPOLLOUT){
-            threadPool.enqueue(
-               [this, clientSocket]() {
-                  this ->handleWritable(clientSocket);
-               }
-            );
-         }
-         else{
-            threadPool.enqueue(
-               [this, clientSocket]() {
-                  this-> handleOnce(clientSocket);
-               }
-            );
-         }
-             
-      }, [this](){sweepIdleConnection();}
-   );
+      bool ok = epollEngine.run([this](int clientSocket, uint32_t events)
+      {
+         dispatchReady(clientSocket, events);
+      }, [this]()
+      {
+         sweepIdleConnection();
+      });
+
       shutdownServer();
       return ok;
+   }
 
-    }
 
     void HTTPServer::stop(){
       running = false;

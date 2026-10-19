@@ -18,11 +18,12 @@ public:
     bool armConnection(int fd, uint32_t events = EPOLLIN);
     bool addConnection(int fd);
     void removeConnection(int fd);
-    bool init(int port, int backlog = 128);
+    bool init(int port, int backlog = 128, ClientHandler onAccept = nullptr);
     bool run(const ConnHandler& onConnWorking, const TickHandler& onTick = nullptr);
     bool stop();
     
     int listeningSocket() const;
+    int epollFd() const;
 
 
 private:
@@ -31,6 +32,7 @@ private:
     int epollFd_;
     bool running_;
     int wakeupFd_;
+    ClientHandler onAccept_;
 
     bool setNonBlocking(int fd);
     bool createListeningSocket(int port, int backlog);

@@ -5,12 +5,17 @@
 #include <unordered_set>
 #include <mutex>
 #include <chrono>
+#include <atomic>
+#include <cstdint>
+#include <memory>
+#include <vector>
+
 #include "ThreadPool.h"
 #include "EpollEngine.h"
 #include "MimeTypes.h"
 #include "FileCache.h"
-#include <atomic>
-#include <cstdint>
+#include "SubReactor.h"
+
 
 class HTTPServer{
 public:
@@ -37,10 +42,14 @@ private:
    EpollEngine epollEngine;
    MimeTypes mimeTypes;
    FileCache fileCache;
+   std::vector<std::unique_ptr<SubReactor>> subReactors_;
+   std::unordered_map<int, int> fdEpoll_;  // fd → 归属的 epollFd_
+   std::atomic<size_t> nextSub_{0};  //计数器      
    std::atomic<uint64_t> totalRequests_{0}; //记录总的有效请求次数
    std::atomic<uint64_t> cacheHits_{0}; //缓存get命中次数
    std::atomic<uint64_t> cacheMisses_{0}; //缓存get未命中次数
    std::chrono::steady_clock::time_point startTime_{std::chrono::steady_clock::now()}; //服务器开启的时刻
+   static constexpr size_t kSubReactorCount = 2;
 
    enum class ReadStatus {Request, WaitMore, Closed, Error, TooLarge};
 
@@ -53,6 +62,11 @@ private:
    std::string extractPath(const std::string& request);
    std::string createResponse(const std::string& content, const std::string& contentType = "text/html", int statusCode = 200, bool keepAlive = true, 
                                           const struct timespec* mtime = nullptr);
+   void dispatchNewConnection(int clientFd);   // accept拿到fd后派发
+   void dispatchReady(int fd, uint32_t events); // 就绪事件派发
+   bool armOn(int epfd, int fd, uint32_t events); // 往指定 epoll 重新武装
+   void removeOn(int epfd, int fd);             // 从指定 epoll 摘除
+
    bool processRequest(int clientSocket, const std::string& request);
    void handleOnce(int clientSocket);
    void handleWritable(int fd);
