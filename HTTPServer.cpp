@@ -18,6 +18,8 @@
 #include <unordered_map>
 #include <vector>
 #include <mutex>
+#include <future>
+#include <memory>
 #include "HTTPServer.h"
    static epoll_event makeEvent(int fd, uint32_t events){
     epoll_event ev{};
@@ -25,6 +27,35 @@
     ev.data.fd = fd;
     return ev;
    }
+
+   static constexpr long long kRatelimitCapacity = 100LL * 1024 * 1024;  // 桶容量 100MB 也就是cap
+   static constexpr long long kRatelimitRate     =  10LL * 1024 * 1024;  // 每秒补 10MB 就是rate
+   //令牌桶算法的lua脚本: 每个key对应一个ip 每个field有tok和ts两项 分别对应可用余量和上一次修改时间
+   //余量的更新是懒加载的 并对于每个可以设计ttl防止无限膨胀
+   static const char* kRatelimitScript = R"LUA(
+   local t    = redis.call('HMGET', KEYS[1], 'tok', 'ts')
+   local tok  = tonumber(t[1])   
+   local ts   = tonumber(t[2])
+   local now  = tonumber(ARGV[1])
+   local cap  = tonumber(ARGV[2])
+   local rate = tonumber(ARGV[3])
+   local need = tonumber(ARGV[4])
+   local ttl  = math.ceil(cap / rate * 2)
+
+   if tok == nil then tok, ts = cap, now end
+   tok = math.min(cap, tok + math.max(0, now - ts) * rate)
+
+   if tok < need then
+   redis.call('HMSET', KEYS[1], 'tok', tok, 'ts', now)
+   redis.call('EXPIRE', KEYS[1], ttl)
+   return -1
+   end
+
+   tok = tok - need
+   redis.call('HMSET', KEYS[1], 'tok', tok, 'ts', now)
+   redis.call('EXPIRE', KEYS[1], ttl)
+   return math.floor(tok)
+   )LUA";
 
    HTTPServer::ReadStatus HTTPServer::readRequest(int clientSocket,std::string& connBuffer, std::string& request){ //将缓冲区内容写到request中 返回值表示读的状态
        const size_t kMaxTotal = 8192;
@@ -447,6 +478,21 @@
             closeConnection(fd);
          }
 
+         //  Redis 必须在这里关，而且要回到 #0 线程做：
+         //    close() 会让未完成的 Redis 回调以 nullptr 跑一遍，那时 SubReactor 还活着才安全；
+         //    晚一步（等到 ~HTTPServer）就是打在已销毁的 SubReactor 上。
+         {
+            if(!subReactors_.empty()){
+               auto closed = std::make_shared<std::promise<void>>();   // 堆上持有：超时返回也不会悬垂
+               auto fut = closed->get_future();
+               subReactors_[0]->post([this, closed]{   // 值捕获 shared_ptr，不是引用
+                  redis_.close();
+                  closed->set_value();
+               });
+               fut.wait_for(std::chrono::milliseconds(500));   // 兜底超时：析构里还会再兜一次
+            }
+         }
+
          for(auto& sr : subReactors_)
          {
             sr->stop();
@@ -546,6 +592,11 @@
 
       void HTTPServer::dispatchReady(int fd, uint32_t events)
          {
+            if(fd == redisFd_.load(std::memory_order_relaxed)){
+               handleRedisEvent(events);
+               return;
+            }
+
             if(events & (EPOLLERR | EPOLLHUP))
             {
                closeConnection(fd);
@@ -559,7 +610,7 @@
                      handleWritable(fd);
                });
             }
-            else
+            if(events & EPOLLIN)
             {
                threadPool.enqueue([this, fd]()
                {
@@ -567,6 +618,15 @@
                });
             }
          }
+
+         void HTTPServer::handleRedisEvent(uint32_t events){
+            if(!redis_.valid()){
+               redisFd_.store(-1, std::memory_order_relaxed);
+               return;
+            }
+            redis_.handleEvent(events);
+         }
+         
 
       bool HTTPServer::armOn(int epfd, int fd, uint32_t events)
          {
@@ -579,6 +639,39 @@
             epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
          }
 
+         void HTTPServer::checkRatelimit(const std::string& ip, long long need,
+                                std::function<void(bool, long long)> done){
+         // 约定：只在 SubReactor #0 线程调用
+         if(!done) return;          // 空 std::function 直接调用会抛 std::bad_function_call
+         if(ratelimitSha_.empty() || !redis_.valid()){
+            done(true, -1);              // 降级：Redis 不可用一律放行
+            return;
+         }
+
+         long long now = static_cast<long long>(std::time(nullptr)); // 指针置空无需构造左值变量
+
+         std::vector<std::string> keys{ "ratelimit:" + ip };
+         std::vector<std::string> args{
+            std::to_string(now),
+            std::to_string(kRatelimitCapacity),
+            std::to_string(kRatelimitRate),
+            std::to_string(need)
+         };
+
+         redis_.evalBySha(ratelimitSha_, keys, args,
+      [done = std::move(done)](redisReply* r){ //根据返回结果判断应该做什么事情
+         if(!r || r->type != REDIS_REPLY_INTEGER){
+            // r 出回调就被 free，错误文本必须当场打出来，否则 NOSCRIPT 之类的真因永远看不到
+            if(r && r->type == REDIS_REPLY_ERROR){
+               std::cerr << "限流脚本执行出错: " << r->str << std::endl;
+            }
+            done(true, -1);       // 出错一律放行，宁放过不误杀
+            return;
+         }
+         long long remain = r->integer;
+         done(remain >= 0, remain);
+      });
+      }
 
 
 
@@ -605,8 +698,7 @@
 
 
 
-    bool HTTPServer::start()
-   {
+    bool HTTPServer::start(){
       for(size_t i = 0; i < kSubReactorCount; ++i)
       {
          auto sr = std::make_unique<SubReactor>();
@@ -641,6 +733,38 @@
       std::cout << "访问地址:http://localhost:" << port << std::endl;
       std::cout << "按ctrl+c停止服务器" << std::endl;
 
+         subReactors_[0]->post([this]{
+
+      SubReactor* sub = subReactors_[0].get();
+
+      //  第 4 个参数是断连通知，被动断连时靠它把这边两个状态一起清掉。
+      //    redisFd_ 留着旧值 → 号被新 HTTP 连接复用 → dispatchReady 误判成 Redis 事件
+      //    ratelimitSha_ 留着旧值 → Redis 重启后缓存已空，每次 EVALSHA 收 NOSCRIPT
+      if(!redis_.connect("127.0.0.1", 6379, sub, [this]{
+            redisFd_.store(-1, std::memory_order_relaxed);
+            ratelimitSha_.clear();
+         })){
+         std::cerr << "Redis 连接失败，限流功能降级" << std::endl;
+         return;                    // 不退出：静态页面不需要 Redis
+      }
+      redisFd_.store(redis_.fd(), std::memory_order_relaxed);
+
+      redis_.scriptLoad(kRatelimitScript, [this](redisReply* r){
+         if(r && r->type == REDIS_REPLY_STRING){
+            ratelimitSha_.assign(r->str, r->len);
+            std::cout << "限流脚本已加载 sha=" << ratelimitSha_ << std::endl;
+         }else{
+            // r->str 里有 Lua 编译错误的行号和原因，出回调就没了，必须当场打
+            if(r && r->type == REDIS_REPLY_ERROR){
+               std::cerr << "限流脚本 LOAD 失败: " << r->str << std::endl;
+            }else{
+               std::cerr << "限流脚本 LOAD 失败（无回复，Redis 可能未连接）" << std::endl;
+            }
+            std::cerr << "限流降级：所有下载请求一律放行" << std::endl;
+         }
+      });
+   });
+
       bool ok = epollEngine.run([this](int clientSocket, uint32_t events)
       {
          dispatchReady(clientSocket, events);
@@ -652,6 +776,7 @@
       shutdownServer();
       return ok;
    }
+
 
 
     void HTTPServer::stop(){

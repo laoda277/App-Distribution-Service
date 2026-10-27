@@ -9,12 +9,14 @@
 #include <cstdint>
 #include <memory>
 #include <vector>
+#include <functional>
 
 #include "ThreadPool.h"
 #include "EpollEngine.h"
 #include "MimeTypes.h"
 #include "FileCache.h"
 #include "SubReactor.h"
+#include "RedisAsyncClient.h"
 
 
 class HTTPServer{
@@ -42,12 +44,15 @@ private:
    EpollEngine epollEngine;
    MimeTypes mimeTypes;
    FileCache fileCache;
+   RedisAsyncClient redis_;
    std::vector<std::unique_ptr<SubReactor>> subReactors_;
    std::unordered_map<int, int> fdEpoll_;  // fd → 归属的 epollFd_
    std::atomic<size_t> nextSub_{0};  //计数器      
    std::atomic<uint64_t> totalRequests_{0}; //记录总的有效请求次数
    std::atomic<uint64_t> cacheHits_{0}; //缓存get命中次数
    std::atomic<uint64_t> cacheMisses_{0}; //缓存get未命中次数
+   std::atomic<int> redisFd_{-1};
+   std::string      ratelimitSha_;
    std::chrono::steady_clock::time_point startTime_{std::chrono::steady_clock::now()}; //服务器开启的时刻
    static constexpr size_t kSubReactorCount = 2;
 
@@ -66,6 +71,9 @@ private:
    void dispatchReady(int fd, uint32_t events); // 就绪事件派发
    bool armOn(int epfd, int fd, uint32_t events); // 往指定 epoll 重新武装
    void removeOn(int epfd, int fd);             // 从指定 epoll 摘除
+   void handleRedisEvent(uint32_t events);
+   void checkRatelimit(const std::string& ip, long long need,
+                       std::function<void(bool ok, long long remain)> done);
 
    bool processRequest(int clientSocket, const std::string& request);
    void handleOnce(int clientSocket);

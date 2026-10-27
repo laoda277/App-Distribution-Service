@@ -75,14 +75,25 @@ void SubReactor::loop()
 
         for(int i = 0; i < n; ++i)
         {
+
             int fd = evs[i].data.fd;
 
-            if(fd == wakeupFd_)
+            if(fd == wakeupFd_){
+            uint64_t v = 0;
+            ssize_t r = read(wakeupFd_, &v, sizeof(v));
+            (void)r;
+
+            std::queue<std::function<void()>> tasks;  //搬发送命令
             {
-                uint64_t v = 0;
-                ssize_t r = read(wakeupFd_, &v, sizeof(v));
-                (void)r;
-                continue;
+                std::lock_guard<std::mutex> lk(pendingMutex_);
+                tasks.swap(pending_);      
+            }
+
+            while(!tasks.empty()){
+                tasks.front()();  //发送redis命令
+                tasks.pop();
+            }
+            continue;
             }
 
             if(!onWorking_)
@@ -90,7 +101,7 @@ void SubReactor::loop()
                 continue;
             }
 
-            try
+            try  //统一执行所有任务
             {
                 onWorking_(fd, evs[i].events);
             }
@@ -124,6 +135,17 @@ void SubReactor::removeConnection(int fd)
     {
         connCount_.fetch_sub(1, std::memory_order_relaxed);
     }
+}
+
+void SubReactor::post(std::function<void()> fn){ //任务入队并唤醒
+   {
+      std::lock_guard<std::mutex> lk(pendingMutex_);
+      pending_.push(std::move(fn));
+   }
+
+   uint64_t one = 1;
+   ssize_t r = write(wakeupFd_, &one, sizeof(one));
+   (void)r;   // eventfd 计数溢出才会失败，忽略
 }
 
 void SubReactor::stop()

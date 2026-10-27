@@ -7,6 +7,8 @@
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
 #include <unistd.h>
+#include <mutex>
+#include <queue>
 
 class SubReactor{
 public:
@@ -22,6 +24,7 @@ public:
    bool addConnection(int fd);
    bool arm(int fd, uint32_t events);
    void removeConnection(int fd);
+   void post(std::function<void()> fn); //把工作交给reactor
 
    int epollFd() const { return epollFd_; }
    size_t connectionCount() const { return connCount_.load(std::memory_order_relaxed); }
@@ -37,4 +40,6 @@ private:
    std::atomic<size_t> connCount_{0};
    WorkingHandler onWorking_;
    static constexpr int kMaxEvents = 16;
+   std::mutex pendingMutex_;
+   std::queue<std::function<void()>> pending_;
 };
