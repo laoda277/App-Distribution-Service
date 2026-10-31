@@ -36,7 +36,10 @@ private:
    std::unordered_map<int, std::string> outBuffers_;
    std::mutex connMutex_;
    std::unordered_map<int, std::chrono::steady_clock::time_point> lastActive_;
-   std::unordered_set<int> inFlight_;
+   std::unordered_set<int> inFlight_; //work是否在占着这个fd工作
+   std::unordered_set<int> pendingConn_; //异步正在处理的fd
+   std::unordered_set<int> closeAfterWrite_; //还没写完但想关闭的fd 写完才能关闭 即短链接
+   std::unordered_map<int, uint64_t> connGen_;   // fd → 世代号
    std::chrono::steady_clock::time_point lastSweep_;
    static constexpr std::chrono::seconds kIdleTimeout{30};
    std::string dirRoot = "./www";
@@ -52,9 +55,47 @@ private:
    std::atomic<uint64_t> cacheHits_{0}; //缓存get命中次数
    std::atomic<uint64_t> cacheMisses_{0}; //缓存get未命中次数
    std::atomic<int> redisFd_{-1};
+   std::atomic<uint64_t> genCounter_{0};          // 全局递增，保证绝不重复
    std::string      ratelimitSha_;
    std::chrono::steady_clock::time_point startTime_{std::chrono::steady_clock::now()}; //服务器开启的时刻
    static constexpr size_t kSubReactorCount = 2;
+
+   struct PendingGuard{ //控制pending表的擦除
+   HTTPServer* self;
+   int      fd;
+   uint64_t gen;        // 必须带：fd 号会复用，只有 gen 能区分「还是不是我那条连接」
+
+   PendingGuard(HTTPServer* s, int f, uint64_t g) : self(s), fd(f), gen(g) {}
+   ~PendingGuard(){
+      // 不抛异常，纯清理
+      std::lock_guard<std::mutex> lk(self->connMutex_);
+      auto it = self->connGen_.find(fd);
+      // 只有「配对还成立」才动标记：要么正常结束，要么连接已关（此处不动，
+      // closeConnection 已清过）。gen 不符 = fd 已复用成新连接，绝不能删它的豁免。
+      if(it != self->connGen_.end() && it->second == gen){
+         self->pendingConn_.erase(fd);
+      }
+   }
+
+   PendingGuard(const PendingGuard&) = delete;
+   PendingGuard& operator=(const PendingGuard&) = delete;
+};
+
+   struct FileFdOwner{  //可下载文件的句柄（位于磁盘）
+      int fd = -1;
+      explicit FileFdOwner(int f) : fd(f) {}
+      ~FileFdOwner(){ if(fd >= 0) ::close(fd); }
+      FileFdOwner(const FileFdOwner&) = delete;
+      FileFdOwner& operator=(const FileFdOwner&) = delete;
+      };
+
+   struct SendFileState{
+      std::shared_ptr<FileFdOwner> file;   // 引用计数 保证引用期间不会被释放
+      off_t  offset    = 0;               // 已经发出去多少字节
+      size_t remaining = 0;               // 还剩多少字节
+   };
+   std::unordered_map<int, SendFileState> sendFileStates_;   // sockfd → 发送进度
+
 
    enum class ReadStatus {Request, WaitMore, Closed, Error, TooLarge};
 
@@ -67,6 +108,17 @@ private:
    std::string extractPath(const std::string& request);
    std::string createResponse(const std::string& content, const std::string& contentType = "text/html", int statusCode = 200, bool keepAlive = true, 
                                           const struct timespec* mtime = nullptr);
+   std::string createDownloadHeader(const std::string& contentType,
+                                             long long contentLength,
+                                             int statusCode, bool keepAlive,
+                                             const struct timespec* mtime = nullptr);
+   void sendDownloadError(int fd, int code, const std::string& title, bool keepAlive);
+   std::string peerIp(int fd); //对端ip
+   void sendDownloadFile(int fd, uint64_t gen, const std::string& diskPath,
+                                  bool keepAlive);
+   void sendFileBody(int fd);
+   void saveSendFileProgress(int fd, off_t offset, size_t remaining);
+   void handleDownload(int fd, const std::string& userPath, bool keepAlive);
    void dispatchNewConnection(int clientFd);   // accept拿到fd后派发
    void dispatchReady(int fd, uint32_t events); // 就绪事件派发
    bool armOn(int epfd, int fd, uint32_t events); // 往指定 epoll 重新武装

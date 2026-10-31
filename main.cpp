@@ -1,6 +1,7 @@
 #include "HTTPServer.h"
 #include <iostream>
 #include <string>
+#include<csignal>
 #include "MySQLClient.h"
    int main(int argc, char* argv[]){
       int port = 8080;
@@ -8,6 +9,7 @@
          port = std::stoi(argv[1]);
       }
 
+      signal(SIGPIPE, SIG_IGN);
       MySQLClient::libraryInit();  
       HTTPServer server(port);
 

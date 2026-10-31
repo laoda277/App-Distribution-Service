@@ -18,8 +18,12 @@
 #include <unordered_map>
 #include <vector>
 #include <mutex>
+#include <fcntl.h>
 #include <future>
 #include <memory>
+#include <sys/sendfile.h>
+#include<arpa/inet.h>
+#include<netinet/in.h>
 #include "HTTPServer.h"
    static epoll_event makeEvent(int fd, uint32_t events){
     epoll_event ev{};
@@ -167,6 +171,9 @@
        else if(statusCode==500){
          statusMessage="Internal Server Error";
        }
+       else if(statusCode==429){
+          statusMessage="Too Many Requests"; 
+       }
        else{
          statusMessage="Unknown";
        }
@@ -185,6 +192,46 @@
        response << content;
 
        return response.str();
+      }
+
+
+      std::string HTTPServer::createDownloadHeader(const std::string& contentType,
+                                             long long contentLength,
+                                             int statusCode, bool keepAlive,
+                                             const struct timespec* mtime){   // 默认值只写在 .h
+      // 状态码 → 原因短语。老 createResponse 只认 200/404/500，429 会被写成 "Unknown"
+         const char* statusMessage = "Unknown";
+         switch(statusCode){
+            case 200: statusMessage = "OK";                    break;
+            case 400: statusMessage = "Bad Request";           break;
+            case 403: statusMessage = "Forbidden";             break;
+            case 404: statusMessage = "Not Found";             break;
+            case 413: statusMessage = "Payload Too Large";     break;
+            case 429: statusMessage = "Too Many Requests";     break;
+            case 500: statusMessage = "Internal Server Error"; break;
+         }
+
+         std::ostringstream response;
+         response << "HTTP/1.1 " << statusCode << " " << statusMessage << "\r\n";
+         response << "Date: " << httpDate(std::time(nullptr)) << "\r\n";
+         response << "Content-Type: " << contentType << "\r\n";
+         if(mtime != nullptr){                                          //  和 createResponse 保持同样的能力
+            response << "Last-Modified: " << httpDate(mtime->tv_sec) << "\r\n";
+         }
+         response << "Cache-Control: no-cache\r\n";
+         response << "Content-length: " << contentLength << "\r\n";   //  用参数，不是 body 长度
+         response << "Connection: " << (keepAlive ? "keep-alive" : "close") << "\r\n";
+         response << "\r\n";                                          // 空行之后就是文件体
+         return response.str();
+      }
+
+      void HTTPServer::sendDownloadError(int fd, int code, const std::string& title, bool keepAlive){
+         std::string body = "<html><body><h1>" + title + "</h1></body></html>";
+         if(!sendResponse(fd, createResponse(body, "text/html", code, keepAlive))){
+            closeConnection(fd);
+            return;
+         }
+         finishOnce(fd);     // 若还有残留，finishOnce 会自动 arm EPOLLOUT
       }
 
 
@@ -244,6 +291,11 @@
          return keep && alive;
             
          }
+         if(userPath.compare(0, 10, "/download/") == 0){
+            handleDownload(clientSocket, userPath, keep);
+            return true;  //这里不管 关不关闭由closeAfterWrite_ 决定
+         }
+
          char resolved[PATH_MAX];
          if(realpath((dirRoot + userPath).c_str(), resolved) == nullptr){ //转为绝对路径
             bool alive = send404(clientSocket, keep);
@@ -322,6 +374,7 @@
 
       void HTTPServer::handleWritable(int fd){
          std::string out;
+         bool hasSendFile = false;
          {
             std::lock_guard<std::mutex> lk(connMutex_);
             lastActive_[fd] = std::chrono::steady_clock::now();
@@ -331,8 +384,10 @@
                out = std::move(it -> second);
                outBuffers_.erase(it);
             }
+            hasSendFile = (sendFileStates_.count(fd) > 0);
          }
 
+         if(!out.empty()){
          const char* data = out.data();
          size_t toSend = out.size();
          if(!trySend(fd, data, toSend)){
@@ -340,10 +395,34 @@
             return;
          }
          if(toSend > 0){
+            {
             std::lock_guard<std::mutex> lk(connMutex_);
             outBuffers_[fd].append(data, toSend);
-         }
+            }
          finishOnce(fd);
+         return;
+               }
+          }
+          
+          if(hasSendFile){
+            sendFileBody(fd);
+            return;  //让sendFileBody自己arm
+          }
+          bool closing = false; //判断是否需要关闭 此时已经发送完毕
+          {
+            std::lock_guard<std::mutex> lk(connMutex_);
+            auto it = closeAfterWrite_.find(fd);
+            if(it != closeAfterWrite_.end()){
+               closeAfterWrite_.erase(it);
+               closing = true;
+            }
+          }
+          if(closing){
+            closeConnection(fd);
+            return;
+          }
+          finishOnce(fd);
+
       }
 
 
@@ -360,6 +439,12 @@
                if(outIt != outBuffers_.end() && !outIt->second.empty())
                {
                      hasPending = true;
+               }
+
+               auto sendfileIt = sendFileStates_.find(fd);
+               if(sendfileIt != sendFileStates_.end() && sendfileIt ->second.remaining > 0)
+               {
+                  hasPending = true;
                }
 
                auto epIt = fdEpoll_.find(fd);
@@ -388,6 +473,7 @@
             {
                   epfd = it->second;
                   fdEpoll_.erase(it);
+                  connGen_.erase(fd);
             }
          }
 
@@ -401,6 +487,9 @@
             outBuffers_.erase(fd);
             lastActive_.erase(fd);
             inFlight_.erase(fd);
+            pendingConn_.erase(fd);
+            closeAfterWrite_.erase(fd);
+            sendFileStates_.erase(fd);
          }
          close(fd);
       }
@@ -445,6 +534,7 @@
          {
             std::lock_guard<std::mutex> lk(connMutex_);
             for(const auto&[fd, t] : lastActive_){
+               if(pendingConn_.count(fd)) continue;
                if(!inFlight_.count(fd) && now-t > kIdleTimeout)
                   victims.push_back(fd);
             }  
@@ -585,6 +675,7 @@
       {
          std::lock_guard<std::mutex> lk(connMutex_);
          fdEpoll_[clientFd] = targetEpfd;
+         connGen_[clientFd] = ++genCounter_;
       }
    }
 
@@ -639,7 +730,7 @@
             epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
          }
 
-         void HTTPServer::checkRatelimit(const std::string& ip, long long need,
+      void HTTPServer::checkRatelimit(const std::string& ip, long long need,
                                 std::function<void(bool, long long)> done){
          // 约定：只在 SubReactor #0 线程调用
          if(!done) return;          // 空 std::function 直接调用会抛 std::bad_function_call
@@ -672,6 +763,255 @@
          done(remain >= 0, remain);
       });
       }
+
+
+      std::string HTTPServer::peerIp(int fd){ 
+         sockaddr_in addr{};
+         socklen_t len = sizeof(addr);
+         if(getpeername(fd, reinterpret_cast<sockaddr*>(&addr), &len) != 0){
+            return "0.0.0.0";        // 拿不到就归到一个公共桶里，别返回空串
+         }
+         char buf[INET_ADDRSTRLEN]{};
+         inet_ntop(AF_INET, &addr.sin_addr, buf, sizeof(buf));  //把网络二进制字节序转为可呈现地址
+         return buf;
+      }
+
+
+      void HTTPServer::handleDownload(int fd, const std::string& userPath, bool keepAlive){
+         // ── 段 A：worker 线程。只做「路径合不合法、文件在不在、多大」
+         std::string rel = userPath.substr(std::string("/download/").size());
+
+         // 不截的话 /download/a.apk?from=wx 会把 "?from=wx" 拼进磁盘路径 → 全站 404。
+         size_t q = rel.find('?');
+         if(q != std::string::npos) rel.resize(q);
+
+         std::string diskPath = dirRoot + "/" + rel;
+
+         //  路径穿越校验：realpath 会把 ".." 解开，所以必须先 realpath、再比前缀。
+         //    只判字符串里有没有 ".." 是没用的（"....//" 这类变形能绕过）。
+         char resolved[PATH_MAX];
+         char rootResolved[PATH_MAX];
+         if(realpath(diskPath.c_str(), resolved) == nullptr
+            || realpath(dirRoot.c_str(), rootResolved) == nullptr){
+            sendDownloadError(fd, 404, "404 Not Found", keepAlive); 
+            return;
+         }
+         std::string realDisk  = resolved;
+         std::string rootReal  = rootResolved;
+         if(realDisk.compare(0, rootReal.size(), rootReal) != 0
+            || (realDisk.size() > rootReal.size() && realDisk[rootReal.size()] != '/')){
+            sendDownloadError(fd, 404, "404 Not Found", keepAlive); // 404：跑出 dirRoot 之外了
+            return;
+         }
+         diskPath = realDisk;
+
+         struct stat st{};
+         if(stat(diskPath.c_str(), &st) != 0 || !S_ISREG(st.st_mode)){ //s_isreg  是否是普通文件
+            sendDownloadError(fd, 404, "404 Not Found", keepAlive); 
+            return;
+         }
+
+         // need 就是文件字节数，和 cap 同单位。用 stat，不查 MySQL。
+         long long need = static_cast<long long>(st.st_size);
+         std::string ip = peerIp(fd);
+
+         // ── 段 B：占住连接 + 记世代号，然后跳到 #0
+         uint64_t gen = 0;
+         {
+            std::lock_guard<std::mutex> lk(connMutex_);
+            auto it = connGen_.find(fd);
+            if(it == connGen_.end()){
+               return;                      // 连接已经没了，什么都不用做
+            }
+            gen = it->second;
+            pendingConn_.insert(fd);        // 告诉 sweep：这个 fd 在等东西，别杀
+         }  
+
+         subReactors_[0]->post([this, fd, gen, ip, diskPath, need, keepAlive]{ //第一层：从worker线程切换到sub#0 捕获需要的信息
+         checkRatelimit(ip, need, [this, fd, gen, diskPath, keepAlive](bool ok, long long remain){ //第二层：sub#0向hiredis发送请求并登记回调函数
+                                                                        // ok是是否放行 remain是剩余令牌桶容量
+            threadPool.enqueue([this, fd, gen, diskPath, keepAlive, ok]{  //第三层：sub#0又把任务推给线程池 完成文件发送
+
+               PendingGuard guard{this, fd, gen};  
+
+               {
+                  std::lock_guard<std::mutex> lk(connMutex_);
+                  auto it = connGen_.find(fd);
+                  if(it == connGen_.end() || it->second != gen){
+                     return;             
+                  }
+               }
+
+               if(!ok){  
+                  sendDownloadError(fd, 429, "429 Too Many Requests", keepAlive);
+                  return;  
+               }
+               sendDownloadFile(fd, gen, diskPath, keepAlive);
+            });
+         });
+      });
+   }
+
+
+   void HTTPServer::sendDownloadFile(int fd, uint64_t gen, const std::string& diskPath,
+                                  bool keepAlive){
+         // 先把文件拿到手 —— 这一步只碰磁盘，绝对不碰客户端 fd
+         //  O_NONBLOCK 只为一件事：万一路径变成了 FIFO，open 会阻塞到有写者 ， 那会挂死一个 worker。
+         //  普通文件忽略这个标志，后面的 sendfile 照样跑（非阻塞性看的是 socket 那一侧）。
+         int rawFd = ::open(diskPath.c_str(), O_RDONLY | O_CLOEXEC | O_NONBLOCK);//只读打开， exec时自动关闭文件fd，防止卡住
+         auto file = (rawFd >= 0) ? std::make_shared<FileFdOwner>(rawFd)
+                                 : nullptr;               // RAII：任何 return 都会 close
+
+         // 长度和类型都从手上这个 fd问
+         struct stat fst{};
+         bool ready = (rawFd >= 0
+                     && ::fstat(rawFd, &fst) == 0
+                     && S_ISREG(fst.st_mode));
+         long long fileSize = ready ? static_cast<long long>(fst.st_size) : 0;
+
+         //  身份校验必须在「发任何一个字节」之前，包括那句 404。
+         //   排队等 worker 期间连接可能已经断了、fd 号被新连接复用；对着旧号码 send 一句 404，
+         //  就是往别人的响应流里插一段垃圾。所以顺序是：先 open/fstat（纯磁盘）→ 再校验 → 最后才写字。
+         {
+            std::lock_guard<std::mutex> lk(connMutex_);
+            auto it = connGen_.find(fd);
+            if(it == connGen_.end() || it->second != gen){
+               return;                          // 连接已死：不发、也不登记（file 析构自动 close）
+            }
+            if(!keepAlive && ready){
+               closeAfterWrite_.insert(fd);     // 只给「真发文件」的情况打标记
+            }
+         }
+
+         // 文件不可用 → 404（此时已经确认连接还是我们的）
+         if(!ready){
+            sendDownloadError(fd, 404, "404 Not Found", keepAlive);   // file 析构 → close
+            return;
+         }
+
+         // ③ 只拼响应头。Content-Type 按后缀走，apk → application/vnd.android.package-archive
+         //    mtime 用 fstat 拿到的 st_mtim，客户端下次带 If-Modified-Since 就能判 304（板块 4）
+         std::string header = createDownloadHeader(getMimeType(diskPath), fileSize, 200, keepAlive,
+                                                   &fst.st_mtim);
+
+         const char* data = header.data();
+         size_t toSend    = header.size();
+         if(!trySend(fd, data, toSend)){
+            closeConnection(fd);
+            return;
+         }
+
+         
+         //   必须先发完头才能 sendfile，否则客户端收到的字节顺序是乱的。
+         if(toSend > 0){// 头没一次发完 → 剩余塞进 outBuffers_，并登记outBuffers_
+            {
+               std::lock_guard<std::mutex> lk(connMutex_);
+               outBuffers_[fd].append(data, toSend);
+               if(fileSize > 0){
+                  SendFileState st;
+                  st.file      = std::move(file);
+                  st.offset    = 0;
+                  st.remaining = static_cast<size_t>(fileSize);
+                  sendFileStates_[fd] = std::move(st);  //登记需要发送的文件， 在handlewritable里检查， 发送完头后发送主体
+               }
+            }
+            finishOnce(fd);            // 直接走 arm epollout 等头发送完之后 再发送剩余文件
+            return;
+         }
+
+         if(fileSize == 0){ //空文件直接收尾
+            
+            bool closing = false; //是否需要关闭
+            {
+               std::lock_guard<std::mutex> lk(connMutex_);
+               auto it = closeAfterWrite_.find(fd);
+               if(it != closeAfterWrite_.end()){ closeAfterWrite_.erase(it); closing = true; }
+            }
+            if(closing) closeConnection(fd);
+            else        finishOnce(fd);
+            return;
+         }
+
+         //  登记状态，开始发文件体
+         {
+            std::lock_guard<std::mutex> lk(connMutex_);
+            SendFileState st;   //发送状态结构体
+            st.file      = std::move(file);  //指向filefdowner的shared_ptr
+            st.offset    = 0;
+            st.remaining = static_cast<size_t>(fileSize);
+            sendFileStates_[fd] = std::move(st);
+         }
+         sendFileBody(fd);
+
+
+      }
+
+
+      void HTTPServer::sendFileBody(int fd){
+         std::shared_ptr<FileFdOwner> file;
+         off_t  offset    = 0;
+         size_t remaining = 0;
+         {
+            std::lock_guard<std::mutex> lk(connMutex_);
+            auto it = sendFileStates_.find(fd);
+            if(it == sendFileStates_.end()){
+               finishOnce(fd);                       // 没有在途的 sendfile，交回普通收尾
+               return;
+            }
+            file      = it->second.file;             // 拷一份 shared_ptr，锁外期间保活
+            offset    = it->second.offset;
+            remaining = it->second.remaining;
+         }
+
+         ssize_t n;
+         do{
+            n = ::sendfile(fd, file->fd, &offset, remaining);
+         }while(n < 0 && errno == EINTR);            // 被信号打断就重试
+
+         if(n < 0){
+            if(errno == EAGAIN || errno == EWOULDBLOCK){
+               // 内核发送缓冲区满 —— 完全正常，记住进度等 EPOLLOUT
+               saveSendFileProgress(fd, offset, remaining);
+               finishOnce(fd);
+               return;
+            }
+            closeConnection(fd);             //连接已断
+            return;
+         }
+         if(n == 0){  //正在下载时候 文件被改小了 比如同名覆盖
+            closeConnection(fd);
+            return;
+         }
+
+          remaining -= static_cast<size_t>(n);
+
+         if(remaining == 0){
+            // 发完了：先摘表（FileFdOwner 析构 → close(fileFd)），再看要不要关连接
+            bool closing = false;
+            {
+               std::lock_guard<std::mutex> lk(connMutex_);
+               sendFileStates_.erase(fd);
+               auto it = closeAfterWrite_.find(fd);
+               if(it != closeAfterWrite_.end()){ closeAfterWrite_.erase(it); closing = true; }
+            }
+            if(closing) closeConnection(fd);
+            else        finishOnce(fd);
+            return;
+         }
+
+         saveSendFileProgress(fd, offset, remaining);
+         finishOnce(fd);                             // 还有剩 → arm EPOLLOUT
+      }
+
+      void HTTPServer::saveSendFileProgress(int fd, off_t offset, size_t remaining){ //没写完的存回去记录
+         std::lock_guard<std::mutex> lk(connMutex_);
+         auto it = sendFileStates_.find(fd);
+         if(it != sendFileStates_.end()){
+            it->second.offset    = offset;
+            it->second.remaining = remaining;
+         }
+      }
+               
 
 
 
