@@ -25,6 +25,7 @@
 #include<arpa/inet.h>
 #include<netinet/in.h>
 #include "HTTPServer.h"
+#include "Orm.h"
    static epoll_event makeEvent(int fd, uint32_t events){
     epoll_event ev{};
     ev.events = events | EPOLLONESHOT;
@@ -174,6 +175,18 @@
        else if(statusCode==429){
           statusMessage="Too Many Requests"; 
        }
+       else if(statusCode==400){
+          statusMessage="Bad Request";
+       }
+       else if(statusCode==403){
+          statusMessage="Forbidden";
+       }
+       else if(statusCode==411){
+          statusMessage="Length Required";
+       }
+       else if(statusCode==413){
+          statusMessage="Payload Too Large";
+       }
        else{
          statusMessage="Unknown";
        }
@@ -206,6 +219,7 @@
             case 400: statusMessage = "Bad Request";           break;
             case 403: statusMessage = "Forbidden";             break;
             case 404: statusMessage = "Not Found";             break;
+            case 411: statusMessage = "Length Required";       break;
             case 413: statusMessage = "Payload Too Large";     break;
             case 429: statusMessage = "Too Many Requests";     break;
             case 500: statusMessage = "Internal Server Error"; break;
@@ -231,7 +245,13 @@
             closeConnection(fd);
             return;
          }
-         finishOnce(fd);     // 若还有残留，finishOnce 会自动 arm EPOLLOUT
+         if(!keepAlive){
+            // Connection: close 只是响应头里的一句话，服务端不会因此自动关连接。
+            // 真正关要打 closeAfterWrite_ 标记，handleWritable 把响应发完之后才 close。
+            std::lock_guard<std::mutex> lk(connMutex_);
+            closeAfterWrite_.insert(fd);
+         }
+         finishOnce(fd);     // finishOnce 会自动 arm EPOLLOUT
       }
 
 
@@ -331,6 +351,14 @@
       }
 
       void HTTPServer::handleOnce(int clientSocket){
+         bool receiving = false;
+          {
+            std::lock_guard<std::mutex> lk(connMutex_);
+            receiving = (recvFileStates_.count(clientSocket) > 0);  //对于数据到达的链接来说 假如是正在接受文件的链接（不是新链接，不用处理请求头） 就走continueRecv分支
+          }
+            if(receiving){ continueRecv(clientSocket); return; }
+
+
          std::string buf;
          {
             std::lock_guard<std::mutex> lk(connMutex_);
@@ -345,6 +373,20 @@
             ReadStatus st = readRequest(clientSocket, buf, request);
 
             if(st == ReadStatus::Request) {
+
+               if(isUploadRequest(request)){  //上传文件的路径
+                  if(!beginRecv(clientSocket, request, buf)){
+                     return;                    // beginRecv 内部已经决定了 close 还是 arm
+                  }
+                  bool stillReceiving = false;
+                  {
+                     std::lock_guard<std::mutex> lk(connMutex_);
+                     stillReceiving = (recvFileStates_.count(clientSocket) > 0);
+                  }
+                  if(stillReceiving) return;    // 还没传完，已 arm EPOLLIN，剩下的也是 body
+                  continue;                     // 小文件当场完成，接着处理下一个请求
+               }
+
                bool alive = true; //表示这个链接还能不能保持工作
                try{
                   alive = processRequest(clientSocket, request);
@@ -490,6 +532,7 @@
             pendingConn_.erase(fd);
             closeAfterWrite_.erase(fd);
             sendFileStates_.erase(fd);
+            recvFileStates_.erase(fd); 
          }
          close(fd);
       }
@@ -785,14 +828,14 @@
          size_t q = rel.find('?');
          if(q != std::string::npos) rel.resize(q);
 
-         std::string diskPath = dirRoot + "/" + rel;
+         std::string diskPath = dataRoot + "/" + rel;
 
          //  路径穿越校验：realpath 会把 ".." 解开，所以必须先 realpath、再比前缀。
          //    只判字符串里有没有 ".." 是没用的（"....//" 这类变形能绕过）。
          char resolved[PATH_MAX];
          char rootResolved[PATH_MAX];
          if(realpath(diskPath.c_str(), resolved) == nullptr
-            || realpath(dirRoot.c_str(), rootResolved) == nullptr){
+            || realpath(dataRoot.c_str(), rootResolved) == nullptr){
             sendDownloadError(fd, 404, "404 Not Found", keepAlive); 
             return;
          }
@@ -800,7 +843,7 @@
          std::string rootReal  = rootResolved;
          if(realDisk.compare(0, rootReal.size(), rootReal) != 0
             || (realDisk.size() > rootReal.size() && realDisk[rootReal.size()] != '/')){
-            sendDownloadError(fd, 404, "404 Not Found", keepAlive); // 404：跑出 dirRoot 之外了
+            sendDownloadError(fd, 404, "404 Not Found", keepAlive); // 404：跑出 dataRoot 之外了
             return;
          }
          diskPath = realDisk;
@@ -943,7 +986,6 @@
          }
          sendFileBody(fd);
 
-
       }
 
 
@@ -1011,7 +1053,332 @@
             it->second.remaining = remaining;
          }
       }
-               
+
+      bool HTTPServer::writeAllToDisk(int fd, const char* data, size_t len){  //把数据写入磁盘
+      // 这里只是把数据交给内核 page cache，不是真的落盘
+         while(len > 0){
+            ssize_t n = ::write(fd, data, len);
+            if(n < 0){
+               if(errno == EINTR) continue;
+               return false;
+            }
+            if(n == 0) return false;   // 一个字节都没写进去，再循环就是死循环
+            data += n;
+            len  -= static_cast<size_t>(n);
+         }
+         return true;
+      }
+
+      std::string HTTPServer::sanitizeFileName(const std::string& raw){  //把文件名清洗为安全的形式
+         if(raw.empty() || raw.size() > 200) return "";
+         std::string out;
+         out.reserve(raw.size());
+         for(char c : raw){
+            unsigned char u = static_cast<unsigned char>(c);
+            // 只放行：字母 数字 . - _ ；其余（含 / \ : 控制字符 中文）一律换成 _
+            if(std::isalnum(u) || c == '.' || c == '-' || c == '_'){
+               out.push_back(c);
+            }else{
+               out.push_back('_');
+            }
+         }
+         // 全是点的名字（"." ".." "..."）会变成路径穿越，直接拒
+         if(out.find_first_not_of('.') == std::string::npos) return "";
+         return out;
+      }
+
+      std::string HTTPServer::extensionOf(const std::string& name){ //寻找扩展名
+         size_t dot = name.find_last_of('.');
+         if(dot == std::string::npos) return "";      // 没有点，无扩展名
+         if(dot == 0) return "";                      // ".bashrc" 这种不算扩展名
+         std::string ext = name.substr(dot);
+         if(ext.size() > 10) return "";               // 太长的不是扩展名，是文件名里的点
+         return ext;
+      }
+
+      bool HTTPServer::isUploadRequest(const std::string& request){  //判断request头里是否是上传请求
+         // 第一行形如 "PUT /upload/app.apk HTTP/1.1"
+         if(request.compare(0, 4, "PUT ") != 0) return false;
+         size_t sp = request.find(' ');
+         if(sp == std::string::npos) return false;
+         return request.compare(sp + 1, 8, "/upload/") == 0;
+      }
+
+      long long HTTPServer::parseContentLength(const std::string& request){  //提取content-length字段值
+         std::string v = extractHeader(request, "content-length");
+         if(v.empty()) return -1;
+         try{
+            size_t used = 0;
+            long long n = std::stoll(v, &used);
+            if(used != v.size() || n < 0) return -1;    // "123abc" 不能静默变 123
+            return n;
+         }catch(...){
+            return -1;
+         }
+      }
+
+      bool HTTPServer::beginRecv(int fd, const std::string& request, std::string& buf){  //用于处理 已经处理完请求头后缓冲区里剩下的请求体并登记recvFileStates_ 
+                                                                                          //  在处理完请求头后调用 
+         // ── 1. 校验三件事，任何一条不过就当场回错误，别建文件
+         if(extractHeader(request, "transfer-encoding").size() > 0){
+            sendDownloadError(fd, 400, "400 Chunked Not Supported", false);
+            return false;
+         }
+         long long len = parseContentLength(request);
+         if(len < 0){
+            sendDownloadError(fd, 411, "411 Length Required", false);
+            return false;
+         }
+         if(len > kMaxUploadSize){
+            sendDownloadError(fd, 413, "413 Payload Too Large", false);
+            return false;
+         }
+
+         // ── 2. 文件名：先截 query，再取 basename，最后白名单过滤
+         //  /upload/app.apk?v=1
+         //  └──┬───┘└──┬───┘└─┬─┘
+         // prefix  basename query
+         //    定位资源        修饰请求
+         std::string rawPath = extractPath(request);
+         size_t q = rawPath.find('?');                    // extractPath 不截 query，这里必须自己截
+         if(q != std::string::npos) rawPath.resize(q);
+
+         static const std::string kUploadPrefix = "/upload/";  //判断是不是upload
+         if(rawPath.compare(0, kUploadPrefix.size(), kUploadPrefix) != 0){
+            sendDownloadError(fd, 400, "400 Bad Path", false);
+            return false;
+         }
+         std::string name = rawPath.substr(kUploadPrefix.size());  //截取basename
+
+         size_t slash = name.find_last_of('/');  //只要最后一个/后面的内容
+         if(slash != std::string::npos) name = name.substr(slash + 1);
+         name = sanitizeFileName(name);  //清洗后的文件名称
+         if(name.empty()){
+            sendDownloadError(fd, 400, "400 Bad Filename", false);
+            return false;
+         }
+
+         // ── 3. 建临时文件（data/tmp 下，web root 之外）
+         std::string tmpPath = dataRoot + "/tmp/" + std::to_string(fd) + "_" +
+                              std::to_string(std::time(nullptr)) + ".part";
+         int rawFd = ::open(tmpPath.c_str(),
+                           O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+         if(rawFd < 0){
+            std::cerr << "上传临时文件创建失败: " << tmpPath << " : " << std::strerror(errno) << std::endl;
+            sendDownloadError(fd, 500, "500 Cannot Create Temp File", false);
+            return false;
+         }
+
+         // ── 3.5 回 100 Continue：curl 传大文件会先问「能收吗」，不答就干等 1 秒
+         if(extractHeader(request, "expect").find("100-continue") != std::string::npos){
+            static const char kContinue[] = "HTTP/1.1 100 Continue\r\n\r\n";
+            ::send(fd, kContinue, sizeof(kContinue) - 1, 0);
+         }
+
+         auto st      = std::make_shared<RecvFileState>();
+         st->file     = std::make_shared<TempFileOwner>(rawFd, tmpPath);
+         st->fileName = name;
+         st->mime = getMimeType(name);
+         st->total     = len;
+         st->remaining = len;
+         SHA256_Init(&st->sha);
+
+         // ─buf 里已经躺着 body 的开头，请求头已经处理完，必须先处理剩余的请求体
+         if(!buf.empty() && st->remaining > 0){
+            size_t take = std::min<size_t>(buf.size(), static_cast<size_t>(st->remaining));
+            if(!writeAllToDisk(rawFd, buf.data(), take)){
+               sendDownloadError(fd, 500, "500 Write Failed", false);
+               return false;                     // TempFileOwner 析构 → close + unlink
+            }
+            SHA256_Update(&st->sha, buf.data(), take);
+            st->remaining -= static_cast<long long>(take);
+            buf.erase(0, take);
+            // 多出来的字节（buf 比 body 还长）= pipelining 的下一个请求，留着
+         }
+
+         // ── 5. 小文件可能已经收完
+         if(st->remaining == 0){
+            return finishRecv(fd, st);          // 不再登记表，直接收尾
+         }
+
+         // ── 6. 登记，等后续 EPOLLIN
+         {
+            std::lock_guard<std::mutex> lk(connMutex_);
+            auto it = connGen_.find(fd);
+            if(it == connGen_.end()){
+               return false;                      // 连接已经没了
+            }
+            st->gen = it->second;
+            recvFileStates_[fd] = st;
+            pendingConn_.insert(fd);              // 告诉 sweep：在传大文件，别按 30 秒杀
+         }
+         finishOnce(fd);                          // arm EPOLLIN
+         return true;
+      }
+
+
+      void HTTPServer::continueRecv(int fd){ //用于处理已经登记在recvFileStates_里的大文件上传
+         std::shared_ptr<RecvFileState> st;
+         {
+            std::lock_guard<std::mutex> lk(connMutex_);
+            lastActive_[fd] = std::chrono::steady_clock::now();
+            inFlight_.insert(fd);
+            auto it = recvFileStates_.find(fd);
+            if(it == recvFileStates_.end()){
+               finishOnce(fd);
+               return;
+            }
+            st = it->second;                     // 拷一份 shared_ptr，锁外期间保活
+         }
+
+         char chunk[kRecvChunk];
+         while(st->remaining > 0){
+            ssize_t n;
+            do{
+               n = ::recv(fd, chunk, sizeof(chunk), 0);
+            }while(n < 0 && errno == EINTR);
+
+            if(n < 0){
+               if(errno == EAGAIN || errno == EWOULDBLOCK){
+                  finishOnce(fd);                // 没数据了，释放 worker，等下次 EPOLLIN
+                  return;
+               }
+               closeConnection(fd);              // 连接废了 → 析构删临时文件
+               return;
+            }
+            if(n == 0){
+               // 客户端关了，但还没传够 → 提前断开，不是正常完成
+               std::cerr << "上传中断，剩余 " << st->remaining << " 字节" << std::endl;
+               closeConnection(fd);
+               return;
+            }
+
+            size_t take = std::min<size_t>(static_cast<size_t>(n),
+                                          static_cast<size_t>(st->remaining));
+            // recv 已经把 n 字节全部搬进 chunk 了，超出 body 的尾巴是下一个请求
+            //    不存回去就是静默丢一个请求（它已经不在 socket 里了）
+            if(static_cast<size_t>(n) > take){
+               std::lock_guard<std::mutex> lk(connMutex_);
+               connBuffers_[fd].append(chunk + take, static_cast<size_t>(n) - take);
+            }
+            if(!writeAllToDisk(st->file->fd, chunk, take)){
+               // 先摘表：st 析构时才 unlink；这里不能 closeConnection，否则 500 发不出去
+               {
+                  std::lock_guard<std::mutex> lk(connMutex_);
+                  recvFileStates_.erase(fd);
+                  pendingConn_.erase(fd);
+               }
+               sendDownloadError(fd, 500, "500 Write Failed", false);
+               return;
+            }
+            SHA256_Update(&st->sha, chunk, take);
+            st->remaining -= static_cast<long long>(take);
+         }
+
+         finishRecv(fd, st);
+      }
+
+
+      bool HTTPServer::finishRecv(int fd, std::shared_ptr<RecvFileState> st){
+         // 失败收尾：从两张表里摘掉自己。临时文件由 st 析构负责（release 过的不动）
+         auto detach = [this, fd]{
+            std::lock_guard<std::mutex> lk(connMutex_);
+            recvFileStates_.erase(fd);
+            pendingConn_.erase(fd);
+         };
+
+         // ── 1. 收尾文件：必须 fsync，否则断电后 rename 生效但内容是空的
+         if(::fsync(st->file->fd) != 0){
+            detach();
+            sendDownloadError(fd, 500, "500 Fsync Failed", false);
+            return false;
+         }
+         ::close(st->file->fd);
+         st->file->fd = -1;                     // 防 TempFileOwner 析构重复 close
+
+         // ── 2. 出哈希
+         unsigned char digest[SHA256_DIGEST_LENGTH];  //32字节 每个字节的范围是0到255
+         SHA256_Final(digest, &st->sha);
+         std::string hex;
+         hex.reserve(64);
+         static const char* kHex = "0123456789abcdef";
+         for(int i = 0; i < SHA256_DIGEST_LENGTH; ++i){
+            hex.push_back(kHex[ digest[i] / 16]);
+            hex.push_back(kHex[ digest[i] % 16]);
+         }  //转为64字符
+
+         // ── 3. 查重：同一个内容第二次上传，直接复用磁盘文件
+         std::string ext = extensionOf(st->fileName);       // ".apk" / ".exe" / ""
+         std::string finalPath = dataRoot + "/apps/" + hex + ext;    // dataRoot，不是 dirRoot
+         std::string relUrl    = "/download/apps/" + hex + ext;      // 默认：按本次请求的 ext 算
+         bool dedup = false; //dedup 去重
+
+         {
+            ResultSet rs;
+            std::string sql = "SELECT disk_path FROM files WHERE sha256='"   +   mysqlClient().escape(hex)   +   "'";  //拼接为SQL语句
+            if(mysqlClient().select(sql, rs) && !rs.empty()){ //不为空 表示sql里已经有相同的了
+               dedup = true;
+               ::unlink(st->file->path.c_str());       
+               st->file->release();                       // 手动删除 靠析构也行
+               mysqlClient().execute("UPDATE files SET ref_count = ref_count + 1 WHERE sha256='"
+                                    + mysqlClient().escape(hex) + "'");
+
+
+               const int dpIdx = rs.indexOf("disk_path"); //找disk_path在第几列
+               if(dpIdx >= 0){
+                  const std::string& storedDisk = rs[0].at(static_cast<std::size_t>(dpIdx)); //返回结果肯定只有一行 取第一行的对应列
+                  size_t slash = storedDisk.find_last_of('/');
+                  relUrl = "/download/apps/" +  
+                           ((slash == std::string::npos) ? storedDisk : storedDisk.substr(slash + 1));  //取原来的扩展名
+               }
+            }
+         }
+
+         // ── 4. 首次上传：rename 进 dirRoot，然后入库
+         if(!dedup){
+            if(::rename(st->file->path.c_str(), finalPath.c_str()) != 0){
+               std::cerr << "rename 失败: " << std::strerror(errno) << std::endl;
+               detach();
+               sendDownloadError(fd, 500, "500 Rename Failed", false);
+               return false;
+            }
+            st->file->release();                          // 🔴 rename 成功之后才调；失败时留 path 让析构删临时文件
+
+            std::string sql =
+               "INSERT INTO files (sha256, name, size, mime, disk_path, ref_count) VALUES ('"
+               + mysqlClient().escape(hex)          + "','"
+               + mysqlClient().escape(st->fileName) + "',"
+               + std::to_string(st->total)          + ",'"
+               + mysqlClient().escape(st->mime)     + "','"
+               + mysqlClient().escape(finalPath)    + "',1) "
+               "ON DUPLICATE KEY UPDATE ref_count = ref_count + 1";   // ← 为什么必须带，见下面两段
+            if(!mysqlClient().execute(sql)){
+               // 走到这里只可能是真故障 或者是撞了
+               // 不要 unlink(finalPath)：这个路径可能是另一个并发上传刚建好的成果， 但是撞了
+               std::cerr << "入库失败: " << mysqlClient().errorText() << std::endl;
+               detach();                                  // 文件已 rename 成功，不能删；只摘表
+               sendDownloadError(fd, 500, "500 DB Failed", false);
+               return false;
+            }
+         }
+
+         // ── 5. 从表里摘掉（如果是登记过的那种）
+         detach();
+
+         // ── 6. 回响应
+         std::ostringstream body;
+         body << "{\"ok\":true,\"sha256\":\"" << hex << "\",\"size\":" << st->total
+            << ",\"dedup\":" << (dedup ? "true" : "false")
+            << ",\"url\":\"" << relUrl << "\"}";
+         std::string resp = createResponse(body.str(), "application/json", 200, true);
+         if(!sendResponse(fd, resp)){
+            closeConnection(fd);
+            return false;
+         }
+         finishOnce(fd);
+         return true;
+      }
+                                    
 
 
 
@@ -1032,9 +1399,16 @@
                      dirRoot = resolved;
                      initialized = true;
                   }
-               }
 
-                   
+                  ::mkdir(dataRoot.c_str(), 0755);                  // ./data（相对路径先建）
+                  char dataResolved[PATH_MAX];
+                  if(realpath(dataRoot.c_str(), dataResolved) != nullptr){
+                     dataRoot = dataResolved;                       // 之后是绝对路径，和 dirRoot 对称
+                  }
+                  ::mkdir((dataRoot + "/apps").c_str(), 0755);      // data/apps，正式文件
+                  ::mkdir((dataRoot + "/tmp").c_str(),  0755);      // data/tmp，半成品
+               }
+                               
 
 
 

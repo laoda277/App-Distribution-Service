@@ -10,6 +10,8 @@
 #include <memory>
 #include <vector>
 #include <functional>
+#include <openssl/sha.h>
+
 
 #include "ThreadPool.h"
 #include "EpollEngine.h"
@@ -42,7 +44,10 @@ private:
    std::unordered_map<int, uint64_t> connGen_;   // fd → 世代号
    std::chrono::steady_clock::time_point lastSweep_;
    static constexpr std::chrono::seconds kIdleTimeout{30};
+   static constexpr long long kMaxUploadSize = 2LL * 1024 * 1024 * 1024;   // 单次上传上限 2GB
+   static constexpr size_t    kRecvChunk     = 64 * 1024;                  // 每次 recv 64KB
    std::string dirRoot = "./www";
+   std::string dataRoot = "./data";    // 业务数据根
    ThreadPool threadPool;
    EpollEngine epollEngine;
    MimeTypes mimeTypes;
@@ -97,6 +102,34 @@ private:
    std::unordered_map<int, SendFileState> sendFileStates_;   // sockfd → 发送进度
 
 
+   struct TempFileOwner{  //用于用户上传场景
+      int         fd = -1;
+      std::string path;                 // 临时文件的磁盘路径
+      TempFileOwner(int f, std::string p) : fd(f), path(std::move(p)) {}
+      ~TempFileOwner(){
+         if(fd >= 0) ::close(fd);
+         if(!path.empty()) ::unlink(path.c_str()); //若上传成功则rename迁移走了 没成功则需要析构清理
+      }
+
+      void release(){ path.clear(); }  //rename成功后  不要unlink已经不用了的路径 防止重名危害
+
+      TempFileOwner(const TempFileOwner&) = delete;
+      TempFileOwner& operator=(const TempFileOwner&) = delete;
+   };
+
+   struct RecvFileState{
+      std::shared_ptr<TempFileOwner> file;   // 临时文件，析构即 close + unlink
+      uint64_t     gen       = 0;         // 世代号，防 fd 复用
+      std::string  fileName;              // 客户端给的名字（已清洗）
+      std::string  mime;                  // 入库用
+      long long    remaining = 0;         // 还差多少字节没收
+      long long    total     = 0;         // Content-Length 原值
+      SHA256_CTX   sha{};                 // 增量哈希，边收边算，链式计算出已存入的文件的sha256
+   };
+
+   std::unordered_map<int, std::shared_ptr<RecvFileState>> recvFileStates_;  //socketfd->接受记录
+
+
    enum class ReadStatus {Request, WaitMore, Closed, Error, TooLarge};
 
    ReadStatus readRequest(int clientSocket, std::string& connBuffer, std::string& request);
@@ -112,13 +145,7 @@ private:
                                              long long contentLength,
                                              int statusCode, bool keepAlive,
                                              const struct timespec* mtime = nullptr);
-   void sendDownloadError(int fd, int code, const std::string& title, bool keepAlive);
-   std::string peerIp(int fd); //对端ip
-   void sendDownloadFile(int fd, uint64_t gen, const std::string& diskPath,
-                                  bool keepAlive);
-   void sendFileBody(int fd);
-   void saveSendFileProgress(int fd, off_t offset, size_t remaining);
-   void handleDownload(int fd, const std::string& userPath, bool keepAlive);
+
    void dispatchNewConnection(int clientFd);   // accept拿到fd后派发
    void dispatchReady(int fd, uint32_t events); // 就绪事件派发
    bool armOn(int epfd, int fd, uint32_t events); // 往指定 epoll 重新武装
@@ -140,4 +167,19 @@ private:
    bool send500(int clientSocket, bool keepAlive = false);
    std::string getMimeType(const std::string& path);
    std::string readHTMLFile(const std::string& filename, struct timespec* outMtime = nullptr);
+      void sendDownloadError(int fd, int code, const std::string& title, bool keepAlive);
+   std::string peerIp(int fd); //对端ip
+   void sendDownloadFile(int fd, uint64_t gen, const std::string& diskPath,
+                                  bool keepAlive);
+   void sendFileBody(int fd);
+   void saveSendFileProgress(int fd, off_t offset, size_t remaining);
+   bool writeAllToDisk(int fd, const char* data, size_t len);
+   std::string sanitizeFileName(const std::string& raw);
+   std::string extensionOf(const std::string& name);
+   bool isUploadRequest(const std::string& request);
+   long long parseContentLength(const std::string& request);
+   void handleDownload(int fd, const std::string& userPath, bool keepAlive);
+   bool beginRecv(int fd, const std::string& request, std::string& buf);
+   void continueRecv(int fd);
+   bool finishRecv(int fd, std::shared_ptr<RecvFileState> st);
 };
