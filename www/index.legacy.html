@@ -1,0 +1,649 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>App Distribution Service</title>
+<style>
+:root{
+  --bg:#fffdfb;
+  --fg:#1c1917;
+  --fg2:#57534e;
+  --muted:#a8a29e;
+  --line:#f2eae4;
+  --line2:#faf5f1;
+  --soft:#fff9f5;
+
+  --o1:#f59e0b; --o2:#f97316; --o3:#fb7185; --o4:#db2777;
+  --ok:#10b981; --err:#e11d48;
+
+  --grad:linear-gradient(90deg,#f59e0b,#f97316 26%,#fb7185 58%,#db2777);
+  --grad-text:linear-gradient(92deg,#ea580c,#f43f5e 52%,#db2777);
+  --grad-btn:linear-gradient(135deg,#f97316,#f43f5e);
+}
+*{box-sizing:border-box}
+html,body{margin:0;padding:0;background:var(--bg);color:var(--fg)}
+body{
+  font:14px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;
+  -webkit-font-smoothing:antialiased;letter-spacing:.01em;
+}
+code,pre,.mono{font-family:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,monospace;font-size:12px}
+a{color:inherit;text-decoration:none}
+button{font:inherit;color:inherit;background:none;border:0;cursor:pointer;padding:0}
+input,select{font:inherit;color:inherit}
+
+/* ── 顶部 ───────────────────────────── */
+.hero{
+  background:
+    radial-gradient(900px 240px at 12% -40%, #fff1e6 0%, rgba(255,241,230,0) 70%),
+    radial-gradient(700px 220px at 78% -30%, #ffe9f0 0%, rgba(255,233,240,0) 72%),
+    linear-gradient(180deg,#fffdfb,#fffdfb);
+  border-bottom:1px solid var(--line);
+  position:relative;
+}
+.hero::after{content:"";position:absolute;left:0;right:0;bottom:-1px;height:2px;background:var(--grad);opacity:.9}
+.hero-in{max-width:1060px;margin:0 auto;padding:30px 32px 20px;display:flex;align-items:center;gap:14px;flex-wrap:wrap}
+.logo{width:22px;height:22px;border-radius:7px;background:var(--grad-btn);box-shadow:0 4px 12px -4px rgba(244,63,94,.55);flex:none}
+h1{
+  font-size:17px;font-weight:600;margin:0;letter-spacing:.01em;
+  background:var(--grad-text);-webkit-background-clip:text;background-clip:text;color:transparent;
+}
+.tag{color:var(--muted);font-size:12px;border-left:1px solid var(--line);padding-left:14px}
+.status{margin-left:auto;display:flex;gap:18px;color:var(--muted);font-size:12px;flex-wrap:wrap}
+.status b{color:var(--fg);font-weight:500}
+.dot{display:inline-block;width:6px;height:6px;border-radius:50%;background:var(--ok);margin-right:6px;vertical-align:1px;box-shadow:0 0 0 3px rgba(16,185,129,.14)}
+.dot.off{background:var(--err);box-shadow:0 0 0 3px rgba(225,29,72,.12)}
+
+.wrap{max-width:1060px;margin:0 auto;padding:0 32px 90px}
+@media(max-width:840px){.cols{grid-template-columns:1fr!important;gap:26px!important}.wrap,.hero-in{padding-left:20px;padding-right:20px}}
+
+/* ── 两栏 ───────────────────────────── */
+.cols{display:grid;grid-template-columns:268px 1fr;gap:50px;padding-top:26px}
+
+.eyebrow{display:flex;align-items:center;gap:8px;font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:#b8b0a8;margin:0 0 13px}
+.eyebrow::before{content:"";width:9px;height:9px;border-radius:3px;background:var(--grad)}
+
+/* 产品列 */
+.psearch{width:100%;border:0;border-bottom:1px solid var(--line);padding:7px 0;outline:none;background:none;margin-bottom:6px}
+.psearch:focus{border-color:var(--o3)}
+.psearch::placeholder{color:#cbc4bd}
+.plist{list-style:none;margin:0;padding:0}
+.plist li{
+  padding:9px 10px;margin:0 -10px;border-radius:8px;
+  display:flex;align-items:center;gap:10px;cursor:pointer;transition:background .14s;
+}
+.plist li:hover{background:var(--soft)}
+.plist li.on{background:linear-gradient(90deg,#fff4ec,#fff9f5 70%,transparent)}
+.plist li.on .pname{font-weight:600}
+.avatar{
+  width:24px;height:24px;border-radius:7px;flex:none;color:#fff;
+  display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:600;
+  box-shadow:0 3px 10px -5px rgba(0,0,0,.4);
+}
+.pname{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.pcount{color:var(--muted);font-size:12px;font-variant-numeric:tabular-nums}
+
+/* 版本区 */
+.rhead{display:flex;align-items:baseline;gap:12px;margin-bottom:4px;flex-wrap:wrap}
+.rhead h2{font-size:16px;font-weight:600;margin:0}
+.rhead .meta{color:var(--muted);font-size:12px}
+.rhead .tools{margin-left:auto;display:flex;gap:2px;background:var(--soft);border-radius:999px;padding:2px}
+.tab{font-size:12px;color:var(--muted);padding:3px 12px;border-radius:999px;transition:.15s}
+.tab.on{color:#fff;background:var(--grad-btn);box-shadow:0 4px 12px -6px rgba(244,63,94,.7)}
+
+table{width:100%;border-collapse:collapse;margin-top:16px}
+th{
+  font-size:11px;font-weight:500;letter-spacing:.07em;text-transform:uppercase;color:#b8b0a8;
+  text-align:left;padding:0 10px 9px 0;border-bottom:1px solid var(--line);white-space:nowrap;
+}
+td{padding:12px 10px 12px 0;border-bottom:1px solid var(--line2);vertical-align:top}
+tbody tr{transition:background .12s}
+tbody tr:hover{background:#fffaf6}
+td.num{font-variant-numeric:tabular-nums;color:var(--fg2);white-space:nowrap}
+td.note{color:var(--fg2);max-width:250px}
+.chip{font-size:11px;padding:1px 8px;border-radius:999px;white-space:nowrap;border:1px solid transparent}
+.chip.beta{background:#fff7ed;border-color:#fed7aa;color:#c2410c}
+.chip.prod{background:#ecfdf5;border-color:#a7f3d0;color:#047857}
+.chip.dev{background:#eff6ff;border-color:#bfdbfe;color:#1d4ed8}
+.chip.other{background:#faf5f1;border-color:var(--line);color:var(--fg2)}
+.ops{white-space:nowrap;text-align:right}
+.ops button{font-size:12px;color:var(--muted);margin-left:12px;transition:color .12s}
+.ops button:hover{color:var(--o2)}
+.more{margin-top:16px}
+.more button{font-size:12px;color:var(--o2);border-bottom:1px solid #fed7aa;padding-bottom:1px}
+
+/* 上传 / 发布 */
+.panel{margin-top:58px;padding-top:26px;border-top:1px solid var(--line);position:relative}
+.panel h2{font-size:16px;font-weight:600;margin:0 0 4px}
+.panel .sub{color:var(--muted);font-size:12px;margin:0 0 20px;max-width:640px}
+.row{display:flex;gap:14px;flex-wrap:wrap}
+.field{display:flex;flex-direction:column;gap:5px;min-width:0}
+.field label{font-size:11px;color:var(--muted);letter-spacing:.04em}
+.field input,.field select{
+  border:1px solid var(--line);border-radius:7px;padding:8px 11px;outline:none;background:#fff;min-width:0;
+  transition:border-color .15s,box-shadow .15s;
+}
+.field input::placeholder{color:#d3ccc5}
+.field input:focus,.field select:focus{border-color:var(--o3);box-shadow:0 0 0 3px rgba(251,113,133,.12)}
+.grow{flex:1}
+.w160{width:160px}.w110{width:110px}
+
+.drop{
+  margin:18px 0 8px;border:1px dashed #f0d9cb;border-radius:12px;padding:28px 20px;text-align:center;color:#b8b0a8;
+  background:linear-gradient(180deg,#fffdfb,#fff9f5);transition:.16s;cursor:pointer;
+}
+.drop:hover,.drop.hot{border-color:#fb923c;color:var(--fg2);background:linear-gradient(180deg,#fff9f5,#fff3ea);box-shadow:inset 0 0 0 1px rgba(251,146,60,.08)}
+.drop b{color:var(--o2);font-weight:500}
+
+.bar{height:3px;background:var(--line2);border-radius:3px;overflow:hidden;margin:14px 0 0;display:none}
+.bar i{display:block;height:100%;width:0;background:var(--grad);transition:width .12s linear}
+.bar.on{display:block}
+
+.uploaded{margin-top:14px;padding:13px 15px;border:1px solid #fde8d7;border-radius:9px;display:none;background:linear-gradient(135deg,#fff9f5,#fffdfb)}
+.uploaded.on{display:block}
+.kv{display:flex;gap:10px;font-size:12px;padding:2px 0}
+.kv span:first-child{color:var(--muted);width:60px;flex:none}
+.kv .mono{word-break:break-all;color:var(--fg2)}
+
+.actions{margin-top:20px;display:flex;gap:10px;align-items:center}
+.btn{
+  border-radius:7px;padding:8px 18px;font-size:13px;color:#fff;
+  background:var(--grad-btn);box-shadow:0 8px 20px -10px rgba(244,63,94,.85);transition:.16s;
+}
+.btn:hover{transform:translateY(-1px);box-shadow:0 10px 22px -10px rgba(244,63,94,.9)}
+.btn[disabled]{opacity:.35;cursor:not-allowed;transform:none;box-shadow:none}
+.btn.ghost{background:#fff;color:var(--fg2);border:1px solid var(--line);box-shadow:none}
+.btn.ghost:hover{border-color:var(--o3);color:var(--o2);transform:none}
+
+.msg{font-size:12px;margin-top:12px;min-height:18px}
+.msg.ok{color:#0d9488}
+.msg.err{color:var(--err)}
+
+/* API 表 */
+.api{margin-top:58px;padding-top:26px;border-top:1px solid var(--line)}
+.api table{margin-top:16px}
+.api td:first-child{width:66px}
+.api tr:last-child td{border-bottom:0}
+.api td{color:var(--fg2)}
+.m{font-size:10px;font-weight:600;letter-spacing:.06em;padding:2px 7px;border-radius:5px;display:inline-block}
+.m.get{background:#eff6ff;color:#1d4ed8}
+.m.post{background:#fff7ed;color:#c2410c}
+.m.put{background:#f5f3ff;color:#6d28d9}
+.api .mono{color:var(--fg)}
+
+.empty{color:var(--muted);font-size:13px;padding:26px 0}
+</style>
+</head>
+<body>
+
+<header class="hero">
+  <div class="hero-in">
+    <span class="logo"></span>
+    <h1>App Distribution Service</h1>
+    <span class="tag">内测包分发</span>
+    <div class="status" id="status">
+      <span><i class="dot off"></i><span>连接中</span></span>
+    </div>
+  </div>
+</header>
+
+<div class="wrap">
+
+  <div class="cols">
+    <aside>
+      <p class="eyebrow">产品</p>
+      <input class="psearch" id="search" placeholder="筛选…" autocomplete="off">
+      <ul class="plist" id="plist"><li class="empty">加载中…</li></ul>
+    </aside>
+
+    <section>
+      <div class="rhead">
+        <h2 id="ptitle">选择一个产品</h2>
+        <span class="meta" id="pmeta"></span>
+        <div class="tools">
+          <button class="tab on" data-sort="time">时间</button>
+          <button class="tab" data-sort="version">版本</button>
+        </div>
+      </div>
+
+      <table>
+        <thead>
+          <tr>
+            <th style="width:92px">版本</th>
+            <th style="width:78px">渠道</th>
+            <th style="width:88px">大小</th>
+            <th>说明</th>
+            <th style="width:140px">更新</th>
+            <th style="width:158px"></th>
+          </tr>
+        </thead>
+        <tbody id="rbody">
+          <tr><td colspan="6" class="empty">左侧选一个产品</td></tr>
+        </tbody>
+      </table>
+      <div class="more" id="more"></div>
+    </section>
+  </div>
+
+  <section class="panel">
+    <p class="eyebrow">上传并发布</p>
+    <h2>把一版包推到线上</h2>
+    <p class="sub">文件按内容哈希去重存储；发布记录把版本别名指向这份内容。两步可以分开做 —— 同一份内容能被多个版本引用。</p>
+
+    <div class="drop" id="drop">
+      <b>点击选择文件</b> 或拖拽到这里 · 支持 2GB 以内
+      <input type="file" id="file" hidden>
+    </div>
+    <div class="bar" id="bar"><i></i></div>
+
+    <div class="uploaded" id="uploaded">
+      <div class="kv"><span>sha256</span><span class="mono" id="u-sha"></span></div>
+      <div class="kv"><span>大小</span><span id="u-size"></span></div>
+      <div class="kv"><span>状态</span><span id="u-note"></span></div>
+    </div>
+
+    <div class="row" style="margin-top:18px">
+      <div class="field grow"><label>sha256（可手动粘贴）</label><input id="f-sha" placeholder="64 位十六进制" spellcheck="false"></div>
+    </div>
+    <div class="row" style="margin-top:14px">
+      <div class="field grow"><label>产品名</label><input id="f-product" placeholder="例如 微信"></div>
+      <div class="field w110"><label>版本</label><input id="f-version" placeholder="1.0.0"></div>
+      <div class="field w110"><label>渠道</label>
+        <select id="f-channel"><option>beta</option><option>prod</option><option>dev</option></select>
+      </div>
+    </div>
+    <div class="row" style="margin-top:14px">
+      <div class="field grow"><label>说明（可选）</label><input id="f-note" placeholder="这一版改了什么"></div>
+    </div>
+
+    <div class="actions">
+      <button class="btn" id="submit">登记发布</button>
+      <button class="btn ghost" id="reset">清空</button>
+    </div>
+    <div class="msg" id="msg"></div>
+  </section>
+
+  <section class="api">
+    <p class="eyebrow">接口</p>
+    <table>
+      <tbody>
+        <tr><td><span class="m get">GET</span></td><td class="mono">/api/status</td><td>运行状态、累计请求、各 reactor 连接数</td></tr>
+        <tr><td><span class="m get">GET</span></td><td class="mono">/api/products?limit=&amp;offset=</td><td>产品列表，按最近更新时间聚合</td></tr>
+        <tr><td><span class="m get">GET</span></td><td class="mono">/api/releases?product_name=&amp;sort=version|time</td><td>某产品的版本列表</td></tr>
+        <tr><td><span class="m post">POST</span></td><td class="mono">/api/releases</td><td>登记版本，同 (产品,版本,渠道) 幂等覆盖</td></tr>
+        <tr><td><span class="m put">PUT</span></td><td class="mono">/upload/&lt;filename&gt;</td><td>流式上传，边收边算 sha256，重复内容秒传</td></tr>
+        <tr><td><span class="m get">GET</span></td><td class="mono">/download/apps/&lt;sha&gt;&lt;ext&gt;</td><td>内容直链，支持 Range 断点续传</td></tr>
+        <tr><td><span class="m get">GET</span></td><td class="mono">/pkg/&lt;产品&gt;/&lt;版本&gt;?channel=</td><td>版本别名，302 跳转到内容直链</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+</div>
+
+<script>
+(function(){
+  "use strict";
+
+  var state = { products: [], current: null, sort: "time", items: [], limit: 20, offset: 0 };
+
+  /* 产品头像的配色轮转，名称哈希决定用哪一组 */
+  var PALETTE = [
+    ["#fbbf24", "#f59e0b"],
+    ["#fb923c", "#f97316"],
+    ["#fb7185", "#f43f5e"],
+    ["#f472b6", "#db2777"],
+    ["#fca5a5", "#ef4444"],
+    ["#fcd34d", "#ea580c"]
+  ];
+  function colorOf(name){
+    var h = 0;
+    for(var i = 0; i < name.length; i++) h = (h * 31 + name.charCodeAt(i)) >>> 0;
+    return PALETTE[h % PALETTE.length];
+  }
+
+  var $ = function(id){ return document.getElementById(id); };
+
+  function fmtSize(n){
+    n = Number(n) || 0;
+    if(n < 1024) return n + " B";
+    var u = ["KB","MB","GB","TB"], i = -1;
+    do { n /= 1024; i++; } while(n >= 1024 && i < u.length - 1);
+    return n.toFixed(n < 10 ? 2 : 1) + " " + u[i];
+  }
+  function fmtUp(s){
+    s = Math.floor(s);
+    var d = Math.floor(s/86400), h = Math.floor(s%86400/3600), m = Math.floor(s%3600/60), x = s%60;
+    if(d) return d + "d " + h + "h";
+    if(h) return h + "h " + m + "m";
+    if(m) return m + "m " + x + "s";
+    return x + "s";
+  }
+  function fmtTime(t){ return (t || "").replace(/^\d{4}-/, "").replace(/-/g, "/"); }
+
+  function esc(s){
+    return String(s).replace(/[&<>"']/g, function(c){
+      return { "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;", "'":"&#39;" }[c];
+    });
+  }
+
+  function copy(text, btn){
+    function done(){ if(btn){ var old = btn.textContent; btn.textContent = "已复制"; setTimeout(function(){ btn.textContent = old; }, 1200); } }
+    function fallback(){
+      var ta = document.createElement("textarea");
+      ta.value = text; ta.style.position = "fixed"; ta.style.opacity = "0";
+      document.body.appendChild(ta); ta.select();
+      try { document.execCommand("copy"); done(); } catch(e){}
+      document.body.removeChild(ta);
+    }
+    if(navigator.clipboard && window.isSecureContext){
+      navigator.clipboard.writeText(text).then(done, fallback);
+    }else{
+      fallback();
+    }
+  }
+
+  function hint(el, text, cls){
+    el.textContent = text || "";
+    el.className = "msg" + (cls ? " " + cls : "");
+  }
+
+  function getJSON(path){
+    return fetch(path, { headers: { "accept": "application/json" } }).then(function(r){
+      return r.text().then(function(t){
+        var data = null;
+        try { data = JSON.parse(t); } catch(e){}
+        return { status: r.status, data: data, raw: t };
+      });
+    });
+  }
+
+  function pkgURL(product, version, channel){
+    var u = "/pkg/" + encodeURIComponent(product) + "/" + encodeURIComponent(version);
+    if(channel && channel !== "beta") u += "?channel=" + encodeURIComponent(channel);
+    return u;
+  }
+
+  function chanClass(c){
+    c = String(c || "");
+    if(c === "beta") return "chip beta";
+    if(c === "prod") return "chip prod";
+    if(c === "dev")  return "chip dev";
+    return "chip other";
+  }
+
+  /* ── 状态栏 ─────────────────────────── */
+  function loadStatus(){
+    getJSON("/api/status").then(function(res){
+      var d = res.data;
+      if(!d || d.ok === false || res.status !== 200){
+        $("status").innerHTML = '<span><i class="dot off"></i><span>离线</span></span>';
+        return;
+      }
+      var conn = (d.connections_per_reactor || []).join(" · ") || "0";
+      $("status").innerHTML =
+        '<span><i class="dot"></i>运行 <b>' + fmtUp(d.uptime_seconds) + '</b></span>' +
+        '<span>请求 <b>' + d.total_requests + '</b></span>' +
+        '<span>在途 <b>' + d.in_flight + '</b></span>' +
+        '<span>连接 <b>' + conn + '</b></span>' +
+        '<span>缓存 <b>' + d.cache_hits + '/' + (d.cache_hits + d.cache_misses) + '</b></span>';
+    }).catch(function(){
+      $("status").innerHTML = '<span><i class="dot off"></i><span>离线</span></span>';
+    });
+  }
+
+  /* ── 产品列表 ───────────────────────── */
+  function renderProducts(){
+    var q = $("search").value.trim().toLowerCase();
+    var list = state.products.filter(function(p){
+      return !q || String(p.product_name).toLowerCase().indexOf(q) >= 0;
+    });
+    var ul = $("plist");
+    if(!list.length){
+      ul.innerHTML = '<li class="empty" style="cursor:default">' +
+        (state.products.length ? "没有匹配的产品" : "还没有发布记录") + '</li>';
+      return;
+    }
+    ul.innerHTML = list.map(function(p){
+      var on = p.product_name === state.current ? " on" : "";
+      var c  = colorOf(String(p.product_name));
+      var ch = Array.from(String(p.product_name))[0] || "?";
+      return '<li class="' + on.trim() + '" data-name="' + encodeURIComponent(p.product_name) + '">' +
+             '<span class="avatar" style="background:linear-gradient(135deg,' + c[0] + ',' + c[1] + ')">' + esc(ch) + '</span>' +
+             '<span class="pname">' + esc(p.product_name) + '</span>' +
+             '<span class="pcount">' + p.release_count + '</span></li>';
+    }).join("");
+  }
+
+  function loadProducts(){
+    return getJSON("/api/products?limit=100").then(function(res){
+      state.products = (res.data && res.data.items) || [];
+      if(!state.current && state.products.length) state.current = state.products[0].product_name;
+      renderProducts();
+      if(state.current) loadReleases(false);
+    });
+  }
+
+  /* ── 版本列表 ───────────────────────── */
+  function loadReleases(append){
+    var name = state.current;
+    if(!name){ $("rbody").innerHTML = '<tr><td colspan="6" class="empty">左侧选一个产品</td></tr>'; return; }
+    if(!append) state.offset = 0;
+
+    var url = "/api/releases?product_name=" + encodeURIComponent(name) +
+              "&limit=" + state.limit + "&offset=" + state.offset +
+              (state.sort === "version" ? "&sort=version" : "");
+
+    $("ptitle").textContent = name;
+    $("pmeta").textContent = "";
+
+    getJSON(url).then(function(res){
+      if(res.status !== 200 || !res.data || res.data.ok === false){
+        $("rbody").innerHTML = '<tr><td colspan="6" class="empty">读取失败：' +
+          esc((res.data && res.data.error) || res.status) + '</td></tr>';
+        $("more").innerHTML = "";
+        return;
+      }
+      var items = res.data.items || [];
+      state.items = append ? state.items.concat(items) : items;
+      renderReleases();
+      $("more").innerHTML = items.length === state.limit
+        ? '<button id="morebtn">显示更多</button>' : "";
+      var btn = $("morebtn");
+      if(btn) btn.onclick = function(){ state.offset += state.limit; loadReleases(true); };
+    }).catch(function(){
+      $("rbody").innerHTML = '<tr><td colspan="6" class="empty">网络错误</td></tr>';
+    });
+  }
+
+  function renderReleases(){
+    var tbody = $("rbody");
+    if(!state.items.length){
+      tbody.innerHTML = '<tr><td colspan="6" class="empty">这个产品还没有版本</td></tr>';
+      return;
+    }
+    $("pmeta").textContent = state.items.length + " 个版本";
+    tbody.innerHTML = state.items.map(function(it, i){
+      return '<tr>' +
+        '<td class="mono">' + esc(it.version) + '</td>' +
+        '<td><span class="' + chanClass(it.channel) + '">' + esc(it.channel) + '</span></td>' +
+        '<td class="num">' + fmtSize(it.size) + '</td>' +
+        '<td class="note">' + (it.note ? esc(it.note) : '<span style="color:#d6cfc8">—</span>') + '</td>' +
+        '<td class="num">' + fmtTime(it.updated_at) + '</td>' +
+        '<td class="ops">' +
+          '<button data-act="dl" data-i="' + i + '">下载</button>' +
+          '<button data-act="pkg" data-i="' + i + '">短链</button>' +
+          '<button data-act="range" data-i="' + i + '">Range</button>' +
+        '</td>' +
+      '</tr>';
+    }).join("");
+  }
+
+  /* ── 行内操作 ───────────────────────── */
+  $("rbody").addEventListener("click", function(e){
+    var btn = e.target.closest("button[data-act]");
+    if(!btn) return;
+    var it = state.items[Number(btn.getAttribute("data-i"))];
+    if(!it) return;
+    var act = btn.getAttribute("data-act");
+
+    if(act === "dl"){
+      var a = document.createElement("a");
+      a.href = it.url; a.download = "";
+      document.body.appendChild(a); a.click(); a.remove();
+      return;
+    }
+    if(act === "pkg"){ copy(pkgURL(state.current, it.version, it.channel), btn); return; }
+    if(act === "range"){ probeRange(it, btn); return; }
+  });
+
+  function probeRange(it, btn){
+    var label = btn.textContent;
+    btn.textContent = "…";
+    fetch(it.url, { headers: { "Range": "bytes=0-1023" } }).then(function(r){
+      var cr = r.headers.get("Content-Range") || "";
+      if(r.status === 206)      btn.textContent = "206 · " + cr.replace("bytes ", "");
+      else if(r.status === 200) btn.textContent = "200 整份";
+      else if(r.status === 429) btn.textContent = "429 被限流";
+      else                      btn.textContent = r.status + " 失败";
+      if(r.body && r.body.cancel) r.body.cancel();
+      setTimeout(function(){ btn.textContent = label; }, 2800);
+    }).catch(function(){ btn.textContent = label; });
+  }
+
+  /* ── 排序 / 搜索 / 选中 ──────────────── */
+  document.querySelectorAll(".tab").forEach(function(t){
+    t.addEventListener("click", function(){
+      document.querySelectorAll(".tab").forEach(function(x){ x.classList.remove("on"); });
+      t.classList.add("on");
+      state.sort = t.getAttribute("data-sort");
+      loadReleases(false);
+    });
+  });
+
+  $("search").addEventListener("input", renderProducts);
+
+  $("plist").addEventListener("click", function(e){
+    var li = e.target.closest("li[data-name]");
+    if(!li) return;
+    state.current = decodeURIComponent(li.getAttribute("data-name"));
+    state.items = [];
+    renderProducts();
+    loadReleases(false);
+  });
+
+  /* ── 上传 ───────────────────────────── */
+  var pick = $("file"), drop = $("drop"), bar = $("bar"), barI = bar.firstElementChild;
+
+  // 守卫：pick.click() 产生的点击会冒泡回 drop，不加这一行会无限递归
+  drop.addEventListener("click", function(e){ if(e.target === pick) return; pick.click(); });
+  pick.addEventListener("change", function(){ if(pick.files[0]) upload(pick.files[0]); });
+
+  ["dragenter","dragover"].forEach(function(ev){
+    drop.addEventListener(ev, function(e){ e.preventDefault(); drop.classList.add("hot"); });
+  });
+  ["dragleave","drop"].forEach(function(ev){
+    drop.addEventListener(ev, function(e){ e.preventDefault(); drop.classList.remove("hot"); });
+  });
+  drop.addEventListener("drop", function(e){
+    var f = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+    if(f) upload(f);
+  });
+
+  function upload(file){
+    var box = $("uploaded");
+    box.classList.remove("on");
+    bar.classList.add("on");
+    barI.style.width = "0%";
+    hint($("msg"), "上传中…");
+
+    var xhr = new XMLHttpRequest();
+    xhr.open("PUT", "/upload/" + encodeURIComponent(file.name), true);
+    xhr.setRequestHeader("content-type", "application/octet-stream");
+
+    xhr.upload.onprogress = function(e){
+      if(e.lengthComputable) barI.style.width = (e.loaded / e.total * 100).toFixed(1) + "%";
+    };
+    xhr.onload = function(){
+      bar.classList.remove("on");
+      var data = null;
+      try { data = JSON.parse(xhr.responseText); } catch(e){}
+      if(xhr.status === 200 && data && data.ok){
+        $("u-sha").textContent  = data.sha256 || "";
+        $("u-size").textContent = fmtSize(data.size);
+        $("u-note").textContent = data.dedup ? "秒传：内容已存在，直接复用" : "新内容，已落盘";
+        box.classList.add("on");
+        $("f-sha").value = data.sha256 || "";
+        if(!$("f-product").value && state.current) $("f-product").value = state.current;
+        hint($("msg"), "上传完成，填好产品和版本后点「登记发布」", "ok");
+      }else{
+        var err = (data && data.error) || (xhr.status + " " + (xhr.statusText || ""));
+        hint($("msg"), "上传失败：" + err, "err");
+      }
+    };
+    xhr.onerror = function(){
+      bar.classList.remove("on");
+      hint($("msg"), "上传失败：网络中断（文件可能超过 2GB 上限）", "err");
+    };
+    xhr.send(file);
+  }
+
+  /* ── 登记发布 ───────────────────────── */
+  $("submit").addEventListener("click", function(){
+    var body = {
+      sha256:       $("f-sha").value.trim().toLowerCase(),
+      product_name: $("f-product").value.trim(),
+      version:      $("f-version").value.trim(),
+      channel:      $("f-channel").value,
+      note:         $("f-note").value.trim()
+    };
+    if(body.sha256.length !== 64){ hint($("msg"), "sha256 需要 64 位十六进制", "err"); return; }
+    if(!body.product_name){ hint($("msg"), "产品名不能为空", "err"); return; }
+    if(!/^\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(body.version)){
+      hint($("msg"), "版本号必须是 x.y.z，每段 0-999", "err"); return;
+    }
+
+    var btn = $("submit");
+    btn.disabled = true;
+    hint($("msg"), "提交中…");
+
+    fetch("/api/releases", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body)
+    }).then(function(r){
+      return r.text().then(function(t){
+        var d = null;
+        try { d = JSON.parse(t); } catch(e){}
+        btn.disabled = false;
+        if(r.status === 200 && d && d.ok){
+          var map = { created: "已创建", updated: "已覆盖更新", unchanged: "内容未变，无改动" };
+          hint($("msg"), "发布成功 · " + (map[d.result] || d.result) +
+               " · " + d.product + " " + d.version + " (" + d.channel + ")", "ok");
+          state.current = d.product;
+          loadProducts();
+        }else{
+          hint($("msg"), "失败：" + ((d && d.error) || r.status), "err");
+        }
+      });
+    }).catch(function(){
+      btn.disabled = false;
+      hint($("msg"), "网络错误", "err");
+    });
+  });
+
+  $("reset").addEventListener("click", function(){
+    ["f-sha","f-product","f-version","f-note"].forEach(function(id){ $(id).value = ""; });
+    $("uploaded").classList.remove("on");
+    bar.classList.remove("on");
+    pick.value = "";
+    hint($("msg"), "");
+  });
+
+  /* ── 启动 ───────────────────────────── */
+  loadStatus();
+  setInterval(loadStatus, 3000);
+  loadProducts();
+})();
+</script>
+</body>
+</html>

@@ -22,10 +22,15 @@
 #include <future>
 #include <memory>
 #include <sys/sendfile.h>
+#include <sys/ioctl.h>          //FIONREAD：关连接前查接收缓冲里还剩多少没读的字节
 #include<arpa/inet.h>
+#include <cstdio>       // snprintf / sscanf
 #include<netinet/in.h>
+#include "nlohmann/json.hpp" 
 #include "HTTPServer.h"
 #include "Orm.h"
+
+
    static epoll_event makeEvent(int fd, uint32_t events){
     epoll_event ev{};
     ev.events = events | EPOLLONESHOT;
@@ -33,8 +38,86 @@
     return ev;
    }
 
-   static constexpr long long kRatelimitCapacity = 100LL * 1024 * 1024;  // 桶容量 100MB 也就是cap
-   static constexpr long long kRatelimitRate     =  10LL * 1024 * 1024;  // 每秒补 10MB 就是rate
+   static std::string makeSortKey(int a, int b, int c){  //统一版本号字符串 方便排序 但只保证最少3位 
+      char buf[16];
+      std::snprintf(buf, sizeof(buf), "%03d.%03d.%03d", a, b, c);
+      return std::string(buf);                  // 1.10.2 → "001.010.002"
+   }
+
+   static int hexVal(char c){
+      if(c >= '0' && c <= '9') return c - '0';
+      if(c >= 'a' && c <= 'f') return c - 'a' + 10;
+      if(c >= 'A' && c <= 'F') return c - 'A' + 10;
+      return -1;                       // 非法字符用 -1 表示
+   }
+
+   static bool urlDecodePath(const std::string& in, std::string& out){ //path把%xx转为对应字符 +不转为空格
+      out.clear();
+      for(size_t i = 0; i < in.size(); ++i){
+         if(in[i] != '%'){
+            out += in[i];
+            continue;
+         }
+         // 尾巴上孤零零一个 %：后面不够两个字符
+         if(i + 2 >= in.size()){ return false; }
+         int hi = hexVal(in[i + 1]), lo = hexVal(in[i + 2]);
+         if(hi < 0 || lo < 0){ return false; }   // %GG 之类
+         out += static_cast<char>(hi * 16 + lo);
+         i += 2;
+      }
+      return true;
+   }
+
+   static bool urlDecodeQuery(const std::string& in, std::string& out){ //把%xx转为对应字符，+转为空格
+      out.clear();
+      for(size_t i = 0; i < in.size(); ++i){
+         if(in[i] == '+'){
+            out += ' ';
+            continue;
+         }
+         if(in[i] != '%'){
+            out += in[i];
+            continue;
+         }
+         if(i + 2 >= in.size()) return false;          // 尾巴上孤零零一个 %
+         int hi = hexVal(in[i + 1]);
+         int lo = hexVal(in[i + 2]);
+         if(hi < 0 || lo < 0) return false;            // %GG 之类
+         out += static_cast<char>(hi * 16 + lo);
+         i += 2;
+      }
+      return true;
+   }
+
+   static bool queryGet(const std::string& query, const std::string& key,
+                     std::string& out){                              //把query里key对应的value提取出来
+      size_t pos = 0;
+      while(pos <= query.size()){
+         size_t amp = query.find('&', pos);
+         if(amp == std::string::npos) amp = query.size();
+         const std::string pair = query.substr(pos, amp - pos);
+         const size_t eq = pair.find('=');
+         const std::string k = (eq == std::string::npos) ? pair : pair.substr(0, eq);
+         if(k == key){
+            out = (eq == std::string::npos) ? std::string() : pair.substr(eq + 1);
+            return true;
+         }
+         if(amp == query.size()) break;
+         pos = amp + 1;
+      }
+      return false;
+   }
+
+
+      
+
+   static constexpr long long kRatelimitBurst = 1000000;  // 桶容量 20次  [下载]
+   static constexpr long long kRatelimitQps = 1000000;  // 每秒补 10次   [下载]
+
+   // /pkg/ 不吐字节，只查一次库就回 302。它要防的不是带宽而是「把 MySQL 刷穿」，
+   // 所以配额放宽一个数量级，并且用独立 key —— 两条路径的桶互不占用。
+   static constexpr long long kPkgRatelimitBurst = 100;  // 桶容量 100次
+   static constexpr long long kPkgRatelimitQps   = 50;   // 每秒补 50次
    //令牌桶算法的lua脚本: 每个key对应一个ip 每个field有tok和ts两项 分别对应可用余量和上一次修改时间
    //余量的更新是懒加载的 并对于每个可以设计ttl防止无限膨胀
    static const char* kRatelimitScript = R"LUA(
@@ -63,18 +146,56 @@
    )LUA";
 
    HTTPServer::ReadStatus HTTPServer::readRequest(int clientSocket,std::string& connBuffer, std::string& request){ //将缓冲区内容写到request中 返回值表示读的状态
-       const size_t kMaxTotal = 8192;
+       const size_t kMaxHeader = 8192;            // 请求行 + 头 的上限（原来的 kMaxTotal，语义收窄）
+       const size_t kMaxBody   = 64 * 1024;       // 非上传请求的 body 上限，本项目的 JSON 只有几百字节
        char chunk[4096];
+       bool sentContinue = false;                 // Expect: 100-continue 只回一次
 
        while(true){
          size_t pos = connBuffer.find("\r\n\r\n");
          if(pos != std::string::npos){
-            request = connBuffer.substr(0, pos+4);
-            connBuffer.erase(0, pos+4);
-            return ReadStatus::Request;
-         }
+            const size_t headLen = pos + 4;
+            const std::string head = connBuffer.substr(0, headLen);
 
-         if(connBuffer.size() >= kMaxTotal) return ReadStatus::TooLarge;
+            //  上传请求的 body 可能是 GB 级，必须由 beginRecv 从 connBuffer 里流式吃
+            //    （beginRecv 里 "buf 里已经躺着 body 的开头" 那段就是干这个的）。
+            //    所以这里一旦预读，body 就被吞进 request，beginRecv 拿到的 connBuffer 是空的
+            if(isUploadRequest(head)){
+               request = connBuffer.substr(0, headLen);
+               connBuffer.erase(0, headLen);
+               return ReadStatus::Request;
+            }
+
+            // 非上传请求 判定消息体长度
+            // 看到 Transfer-Encoding 就拒绝。本项目不支持 chunked，绝不按 Content-Length 去读，
+            if(!extractHeader(head, "transfer-encoding").empty()) return ReadStatus::BadRequest;
+
+            long long bodyLen = 0;
+            if(!extractHeader(head, "content-length").empty()){
+               bodyLen = parseContentLength(head);       
+               if(bodyLen < 0) return ReadStatus::BadRequest;
+            }
+            if(bodyLen > static_cast<long long>(kMaxBody)) return ReadStatus::PayloadTooLarge;
+
+            const size_t need = headLen + static_cast<size_t>(bodyLen);
+            if(connBuffer.size() >= need){
+               request = connBuffer.substr(0, need);
+               connBuffer.erase(0, need);
+               return ReadStatus::Request;
+            }
+
+            // 头齐了但 body 没齐。客户端可能带着 Expect: 100-continue 在等我们点头，
+            // 不答它就只能干等到自己的超时（curl 会白等 1 秒）。
+            if(!sentContinue && extractHeader(head, "expect").find("100-continue") != std::string::npos){
+               static const char kContinue[] = "HTTP/1.1 100 Continue\r\n\r\n";
+               ::send(clientSocket, kContinue, sizeof(kContinue) - 1, MSG_NOSIGNAL);
+               sentContinue = true;
+            }
+         }
+         else{
+            // 头还没齐，这时才用 header 上限判断
+            if(connBuffer.size() >= kMaxHeader) return ReadStatus::TooLarge;
+         }
 
          ssize_t n;
          do{
@@ -158,6 +279,16 @@
       return request.substr(start+1,end-start-1);
       } 
 
+   bool HTTPServer::methodIs(const std::string& request, const std::string& method){
+      // 请求行形如 "POST /api/releases HTTP/1.1"，动词就是第一个空格之前那一段。
+      // HTTP 方法名大小写敏感（RFC 9110），不做 tolower。
+      if(request.size() <= method.size()) return false;
+      if(request.compare(0, method.size(), method) != 0) return false;
+      // 必须紧跟空格，否则 "POSTER" 会被误判成 "POST"
+      return request[method.size()] == ' ';
+   }
+
+
 
       std::string HTTPServer::createResponse(const std::string& content, const std::string& contentType,
                                                       int statusCode, bool keepAlive, const struct timespec* mtime) { 
@@ -187,6 +318,9 @@
        else if(statusCode==413){
           statusMessage="Payload Too Large";
        }
+       else if(statusCode==431){
+          statusMessage="Request Header Fields Too Large";
+       }
        else{
          statusMessage="Unknown";
        }
@@ -211,16 +345,18 @@
       std::string HTTPServer::createDownloadHeader(const std::string& contentType,
                                              long long contentLength,
                                              int statusCode, bool keepAlive,
-                                             const struct timespec* mtime){   // 默认值只写在 .h
-      // 状态码 → 原因短语。老 createResponse 只认 200/404/500，429 会被写成 "Unknown"
+                                             const struct timespec* mtime,
+                                             long long rangeStart, long long rangeEnd, long long totalSize){   // 默认值只写在 .h
          const char* statusMessage = "Unknown";
          switch(statusCode){
             case 200: statusMessage = "OK";                    break;
+            case 206: statusMessage = "Partial Content";        break;
             case 400: statusMessage = "Bad Request";           break;
             case 403: statusMessage = "Forbidden";             break;
             case 404: statusMessage = "Not Found";             break;
             case 411: statusMessage = "Length Required";       break;
             case 413: statusMessage = "Payload Too Large";     break;
+            case 416: statusMessage = "Range Not Satisfiable";  break;
             case 429: statusMessage = "Too Many Requests";     break;
             case 500: statusMessage = "Internal Server Error"; break;
          }
@@ -233,6 +369,14 @@
             response << "Last-Modified: " << httpDate(mtime->tv_sec) << "\r\n";
          }
          response << "Cache-Control: no-cache\r\n";
+         response << "Accept-Ranges: bytes\r\n"; //声明有能力
+         if(statusCode == 416){
+            // 416 只报总长，不给区间 —— 语法就是这么规定的：bytes */<total>
+            response << "Content-Range: bytes */" << totalSize << "\r\n";
+         }else if(statusCode == 206){
+            response << "Content-Range: bytes " << rangeStart << "-"  //声明本次区间
+                     << rangeEnd << "/" << totalSize << "\r\n";
+         }
          response << "Content-length: " << contentLength << "\r\n";   //  用参数，不是 body 长度
          response << "Connection: " << (keepAlive ? "keep-alive" : "close") << "\r\n";
          response << "\r\n";                                          // 空行之后就是文件体
@@ -269,10 +413,16 @@
       bool HTTPServer::processRequest(int clientSocket, const std::string& request){ 
          bool keep = !clientWantsClose(request); //表示是否还保持长连接
          std::string userPath = extractPath(request);  
+         std::string query;
+         const size_t qpos = userPath.find('?');  //提取纯净路径 删除参数
+         if(qpos != std::string::npos){
+            query = userPath.substr(qpos + 1);
+            userPath.erase(qpos);
+         }
          totalRequests_.fetch_add(1, std::memory_order_relaxed); //最宽松约束 无需关注顺序
 
          if(userPath == "/" || userPath .empty()){
-            userPath = "/DefaultPage.html";
+            userPath = "/index.html";
          }
          if(userPath == "/about") {
             userPath = "/AboutPage.html";
@@ -286,34 +436,45 @@
             auto uptime = std::chrono::duration_cast<std::chrono::seconds>( //duration是时间转换 把纳秒转为整秒
                std::chrono::steady_clock::now() - startTime_).count(); //计算到现在的时间 .count只要数据不用单位
 
-               std::ostringstream body;
-               body << "{" << "\"uptime_seconds\":"   << uptime     //转义符号\把"回归本意输出
-                    << ",\"total_requests\":"   << totalRequests_.load(std::memory_order_relaxed) //读取的内存顺序要求
-                    << ",\"cache_hits\":"    << cacheHits_.load(std::memory_order_relaxed)
-                    << ",\"cache_misses\":"   << cacheMisses_.load(std::memory_order_relaxed)
-                    << ",\"in_flight\":"   << inFlight
-                    << ",\"connections_per_reactor\":[";
-                     for(size_t i = 0; i < subReactors_.size(); ++i)
-                     {
-                        if(i > 0)
-                        {
-                           body << ",";
-                        }
+            nlohmann::ordered_json out;
+            out["uptime_seconds"] = uptime;
+            out["total_requests"] = totalRequests_.load(std::memory_order_relaxed);
+            out["cache_hits"]     = cacheHits_.load(std::memory_order_relaxed);
+            out["cache_misses"]   = cacheMisses_.load(std::memory_order_relaxed);
+            out["in_flight"]      = inFlight;
+            out["log_pending"]    = logWriter_.pending();   // 队列积压
+            out["log_dropped"]    = logWriter_.dropped();   // 队列满丢弃累计
+            out["log_pruned"]     = logWriter_.pruned();    // 保留策略已删除累计
+            out["connections_per_reactor"] = nlohmann::ordered_json::array();
+            for(const auto& r : subReactors_){
+               out["connections_per_reactor"].push_back(r->connectionCount());
+            }
 
-                        body << subReactors_[i]->connectionCount();
-                     }
-
-                     body << "]}";
-
-            
-         std::string response = createResponse(body.str(), "application/json", 200, keep);
+            std::string response = createResponse(out.dump(), "application/json", 200, keep);
          bool alive = sendResponse(clientSocket, response);
          return keep && alive;
             
          }
+         if(userPath.compare(0, 5, "/pkg/") == 0){
+            handlePkg(clientSocket, userPath, query, keep);
+            return true;
+         }
          if(userPath.compare(0, 10, "/download/") == 0){
-            handleDownload(clientSocket, userPath, keep);
+            handleDownload(clientSocket, userPath, keep,  extractHeader(request, "range"));
             return true;  //这里不管 关不关闭由closeAfterWrite_ 决定
+         }
+
+         if(userPath == "/api/releases" && methodIs(request, "POST")){  //上传文件版本映射
+            bool alive = handleCreateRelease(clientSocket, request, keep);
+            return keep && alive;   // 同步处理，成败自己知道
+         }
+         if(userPath == "/api/releases" && methodIs(request, "GET")){   //读文件版本映射
+            bool alive = handleListReleases(clientSocket, query, keep);
+            return keep && alive;
+         }
+         if(userPath == "/api/products" && methodIs(request, "GET")){   //产品列表（按产品聚合版本数）
+            bool alive = handleListProducts(clientSocket, query, keep);
+            return keep && alive;
          }
 
          char resolved[PATH_MAX];
@@ -402,8 +563,37 @@
                continue;
             }
             if(st == ReadStatus::WaitMore) break;
-            if(st == ReadStatus::TooLarge) send500(clientSocket);
-            closeConnection(clientSocket);
+
+            // 协议层错误：按原因回对应状态码
+            int code = 0;
+            const char* title = nullptr;
+            switch(st){
+               case ReadStatus::TooLarge:        code = 431; title = "431 Request Header Fields Too Large"; break;
+               case ReadStatus::BadRequest:      code = 400; title = "400 Bad Request";                break;
+               case ReadStatus::PayloadTooLarge: code = 413; title = "413 Payload Too Large";          break;
+               default: break;   // Closed / Error：连接已经废了，不发响应
+            }
+            if(code != 0){
+               // 不用 sendDownloadError：它内部发送失败时会自己 closeConnection，
+               // 外面再 close 一次就是重复 close，而 fd 号此时可能已被新连接复用 → 误杀别人。
+               std::string body = std::string("<html><body><h1>") + title + "</h1></body></html>";
+               if(sendResponse(clientSocket, createResponse(body, "text/html", code, false))){
+                  // 错误响应不足 200 字节，正常情况下一次 send 就发完了。
+                  // 万一对端窗口为 0 没发完，就交给 handleWritable 发完再关，避免只发半截。
+                  bool pending = false;
+                  {
+                     std::lock_guard<std::mutex> lk(connMutex_);
+                     auto it = outBuffers_.find(clientSocket);
+                     pending = (it != outBuffers_.end() && !it->second.empty());
+                     if(pending) closeAfterWrite_.insert(clientSocket);
+                  }
+                  if(pending){
+                     finishOnce(clientSocket);   // 会 arm EPOLLOUT
+                     return;
+                  }
+               }
+            }
+            closeConnection(clientSocket);   // 内部带 lingering，先把接收缓冲读干净再 close
             return;
          }
          {
@@ -483,8 +673,8 @@
                      hasPending = true;
                }
 
-               auto sendfileIt = sendFileStates_.find(fd);
-               if(sendfileIt != sendFileStates_.end() && sendfileIt ->second.remaining > 0)
+               auto sendfileIt = sendFileStates_.find(fd);                                      //没有被限流 可以epollout
+               if(sendfileIt != sendFileStates_.end() && sendfileIt ->second.remaining > 0 && !sendfileIt->second.throttled)
                {
                   hasPending = true;
                }
@@ -508,6 +698,27 @@
       void HTTPServer::closeConnection(int fd){
          int epfd = -1;
 
+   
+         // 标准做法两步：① shutdown 写端发 FIN，让对端知道我们不发了
+         //              ② 把接收方向读干净丢弃，再 close
+         {
+            int pending = 0;
+            if(::ioctl(fd, FIONREAD, &pending) == 0 && pending > 0){
+               ::shutdown(fd, SHUT_WR);
+               char sink[4096];
+               // 最多丢 256KB。恶意客户端如果一直灌，丢掉上限后就不再等了——
+               // 这里是同步阻塞的，不设上限会让一个 worker 被拖住。
+               // 真正的异步 lingering 要留 EPOLLIN 读到 EOF，本项目按 1 秒 sweep 的粒度做不到
+               // 那么细，取「有界同步 drain」这个折中。
+               for(int i = 0; i < 64; ++i){
+                  ssize_t n = ::recv(fd, sink, sizeof(sink), 0);
+                  if(n > 0) continue;
+                  if(n < 0 && errno == EINTR) continue;
+                  break;              // 0 = 对端已关；EAGAIN = 当前读干净了
+               }
+            }
+         }
+
          {
             std::lock_guard<std::mutex> lk(connMutex_);
             auto it = fdEpoll_.find(fd);
@@ -521,7 +732,15 @@
 
          if(epfd >= 0)
          {
-            removeOn(epfd, fd);
+            // 必须交给归属的 SubReactor 去摘：只有它的 removeConnection 会在 DEL 成功后
+            // 把 connCount_ 减一。直接 removeOn 只是裸 epoll_ctl(DEL)，计数永远只增不减，
+            // /api/status 里的 connections_per_reactor 就退化成了「历史累计连接数」。
+            SubReactor* owner = nullptr;
+            for(auto& r : subReactors_){
+               if(r->epollFd() == epfd){ owner = r.get(); break; }
+            }
+            if(owner) owner->removeConnection(fd);
+            else      removeOn(epfd, fd);       // 不在任何 sub 上（主 reactor 自己的 fd）
          }
          {
             std::lock_guard<std::mutex> lk(connMutex_);
@@ -532,6 +751,7 @@
             pendingConn_.erase(fd);
             closeAfterWrite_.erase(fd);
             sendFileStates_.erase(fd);
+            sendBuckets_.erase(fd);        // 桶跟着连接一起销毁
             recvFileStates_.erase(fd); 
          }
          close(fd);
@@ -573,6 +793,31 @@
             if(now - lastSweep_ < std::chrono::seconds(1)) return;
             lastSweep_ =  now;
          }
+
+         std::vector<std::pair<int, uint64_t>> resume;  //判断逻辑:收集所有被限流的连接，交给线程池去除限流标志然后用finishOnce重新epollout
+         {
+            std::lock_guard<std::mutex> lk(connMutex_);
+            for(const auto& [fd, st] : sendFileStates_){
+               if(!st.throttled) continue;
+               auto git = connGen_.find(fd);
+               if(git == connGen_.end()) continue;
+               resume.emplace_back(fd, git->second);
+            }
+         }
+         for(const auto& [fd, gen] : resume){
+            threadPool.enqueue([this, fd, gen]{
+               {
+                  std::lock_guard<std::mutex> lk(connMutex_);
+                  auto it = connGen_.find(fd);
+                  if(it == connGen_.end() || it->second != gen) return;  // fd 已被复用
+                  auto sit = sendFileStates_.find(fd);
+                  if(sit == sendFileStates_.end()) return;
+                  sit->second.throttled = false;
+               }
+               finishOnce(fd);   //内部会区分限流标志 不限流了就装epollout
+            });
+         }
+         
          std::vector<int> victims;
          {
             std::lock_guard<std::mutex> lk(connMutex_);
@@ -773,7 +1018,8 @@
             epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
          }
 
-      void HTTPServer::checkRatelimit(const std::string& ip, long long need,
+      void HTTPServer::checkRatelimit(const std::string& key, long long need,
+                                long long capacity, long long rate,
                                 std::function<void(bool, long long)> done){
          // 约定：只在 SubReactor #0 线程调用
          if(!done) return;          // 空 std::function 直接调用会抛 std::bad_function_call
@@ -784,11 +1030,11 @@
 
          long long now = static_cast<long long>(std::time(nullptr)); // 指针置空无需构造左值变量
 
-         std::vector<std::string> keys{ "ratelimit:" + ip };
+         std::vector<std::string> keys{ key };
          std::vector<std::string> args{
             std::to_string(now),
-            std::to_string(kRatelimitCapacity),
-            std::to_string(kRatelimitRate),
+            std::to_string(capacity),
+            std::to_string(rate),
             std::to_string(need)
          };
 
@@ -820,7 +1066,7 @@
       }
 
 
-      void HTTPServer::handleDownload(int fd, const std::string& userPath, bool keepAlive){
+      void HTTPServer::handleDownload(int fd, const std::string& userPath, bool keepAlive, const std::string& rangeHeader){
          // ── 段 A：worker 线程。只做「路径合不合法、文件在不在、多大」
          std::string rel = userPath.substr(std::string("/download/").size());
 
@@ -858,6 +1104,27 @@
          long long need = static_cast<long long>(st.st_size);
          std::string ip = peerIp(fd);
 
+         ByteRange range;                              // 默认 partial=false，整份发
+         RangeParse rp = RangeParse::None;
+
+         if(!rangeHeader.empty()){
+            rp = parseRangeSpec(rangeHeader, need, range);
+         }
+
+         // 416：语法认得、但起点越界。只回头，不给正文。
+         if(rp == RangeParse::Unsatisfiable){
+            // 不能走 sendDownloadError —— 它不会带 Content-Range: bytes */N，
+            //    客户端拿不到总长就无法自我修正，只能整个放弃。
+            std::string header = createDownloadHeader(getMimeType(diskPath), 0, 416, keepAlive,
+                                                      nullptr, 0, 0, need);
+            if(!sendResponse(fd, header)){
+               closeConnection(fd);
+               return;
+            }
+            finishOnce(fd);
+            return;
+         }
+
          // ── 段 B：占住连接 + 记世代号，然后跳到 #0
          uint64_t gen = 0;
          {
@@ -870,10 +1137,11 @@
             pendingConn_.insert(fd);        // 告诉 sweep：这个 fd 在等东西，别杀
          }  
 
-         subReactors_[0]->post([this, fd, gen, ip, diskPath, need, keepAlive]{ //第一层：从worker线程切换到sub#0 捕获需要的信息
-         checkRatelimit(ip, need, [this, fd, gen, diskPath, keepAlive](bool ok, long long remain){ //第二层：sub#0向hiredis发送请求并登记回调函数
+         subReactors_[0]->post([this, fd, gen, ip, diskPath, need, keepAlive, range]{ //第一层：从worker线程切换到sub#0 捕获需要的信息
+            long long billed = range.partial ? (range.end - range.start +1) : need;
+         checkRatelimit("ratelimit:dl:" + ip, 1, kRatelimitBurst, kRatelimitQps, [this, fd, gen, ip, diskPath, keepAlive, range, billed](bool ok, long long remain){ //第二层：sub#0向hiredis发送请求并登记回调函数
                                                                         // ok是是否放行 remain是剩余令牌桶容量
-            threadPool.enqueue([this, fd, gen, diskPath, keepAlive, ok]{  //第三层：sub#0又把任务推给线程池 完成文件发送
+            threadPool.enqueue([this, fd, gen, ip, diskPath, keepAlive, ok, range, billed]{  //第三层：sub#0又把任务推给线程池 完成文件发送
 
                PendingGuard guard{this, fd, gen};  
 
@@ -886,10 +1154,12 @@
                }
 
                if(!ok){  
+                  logWriter_.write(shaFromPath(diskPath), ip, 0, 429);  //限流也需要写入日志
                   sendDownloadError(fd, 429, "429 Too Many Requests", keepAlive);
                   return;  
                }
-               sendDownloadFile(fd, gen, diskPath, keepAlive);
+               logWriter_.write(shaFromPath(diskPath), ip, billed, 200);
+               sendDownloadFile(fd, gen, diskPath, keepAlive, range);
             });
          });
       });
@@ -897,7 +1167,7 @@
 
 
    void HTTPServer::sendDownloadFile(int fd, uint64_t gen, const std::string& diskPath,
-                                  bool keepAlive){
+                                  bool keepAlive, const ByteRange& range){
          // 先把文件拿到手 —— 这一步只碰磁盘，绝对不碰客户端 fd
          //  O_NONBLOCK 只为一件事：万一路径变成了 FIFO，open 会阻塞到有写者 ， 那会挂死一个 worker。
          //  普通文件忽略这个标志，后面的 sendfile 照样跑（非阻塞性看的是 socket 那一侧）。
@@ -932,10 +1202,14 @@
             return;
          }
 
-         // ③ 只拼响应头。Content-Type 按后缀走，apk → application/vnd.android.package-archive
-         //    mtime 用 fstat 拿到的 st_mtim，客户端下次带 If-Modified-Since 就能判 304（板块 4）
-         std::string header = createDownloadHeader(getMimeType(diskPath), fileSize, 200, keepAlive,
-                                                   &fst.st_mtim);
+         const long long start   = range.partial ? range.start : 0;
+         const long long end     = range.partial ? std::min(range.end, fileSize - 1)
+                                                : fileSize - 1;
+         const long long sendLen = end - start + 1;        // fileSize==0 时正好是 0
+         const int       status  = range.partial ? 206 : 200;
+
+         std::string header = createDownloadHeader(getMimeType(diskPath), sendLen, status, keepAlive,
+                                                   &fst.st_mtim, start, end, fileSize);
 
          const char* data = header.data();
          size_t toSend    = header.size();
@@ -950,11 +1224,11 @@
             {
                std::lock_guard<std::mutex> lk(connMutex_);
                outBuffers_[fd].append(data, toSend);
-               if(fileSize > 0){
+               if(sendLen > 0){
                   SendFileState st;
                   st.file      = std::move(file);
-                  st.offset    = 0;
-                  st.remaining = static_cast<size_t>(fileSize);
+                  st.offset    = static_cast<off_t>(start);
+                  st.remaining = static_cast<size_t>(sendLen);
                   sendFileStates_[fd] = std::move(st);  //登记需要发送的文件， 在handlewritable里检查， 发送完头后发送主体
                }
             }
@@ -962,7 +1236,7 @@
             return;
          }
 
-         if(fileSize == 0){ //空文件直接收尾
+         if(sendLen == 0){ //空文件直接收尾
             
             bool closing = false; //是否需要关闭
             {
@@ -980,8 +1254,8 @@
             std::lock_guard<std::mutex> lk(connMutex_);
             SendFileState st;   //发送状态结构体
             st.file      = std::move(file);  //指向filefdowner的shared_ptr
-            st.offset    = 0;
-            st.remaining = static_cast<size_t>(fileSize);
+            st.offset    = start;
+            st.remaining = static_cast<size_t>(sendLen);
             sendFileStates_[fd] = std::move(st);
          }
          sendFileBody(fd);
@@ -993,27 +1267,57 @@
          std::shared_ptr<FileFdOwner> file;
          off_t  offset    = 0;
          size_t remaining = 0;
+         size_t tokens = 0;
+         bool gone = false;
          {
             std::lock_guard<std::mutex> lk(connMutex_);
             auto it = sendFileStates_.find(fd);
             if(it == sendFileStates_.end()){
-               finishOnce(fd);                       // 没有在途的 sendfile，交回普通收尾
-               return;
+               gone = true;                 // 连接已经没了，锁外 finishOnce 后直接返回
+            }else{
+               file      = it->second.file;             // 拷一份 shared_ptr，锁外期间保活
+               offset    = it->second.offset;
+               remaining = it->second.remaining;
+
+               // 桶跟着 fd 走；operator[] 首次自动构造为满桶
+               // 只在连接还活着时碰 sendBuckets_，否则会给死 fd 留一条永不回收的桶
+               SendBucket& bucket = sendBuckets_[fd];
+               auto now = std::chrono::steady_clock::now();
+               auto us  = std::chrono::duration_cast<std::chrono::microseconds>(
+                           now - bucket.lastRefill).count();
+               long long add = us * static_cast<long long>(kSendRateBytesPerSec) / 1000000;
+               if(add > 0){
+                  bucket.tokens = std::min<long long>(
+                     static_cast<long long>(kSendBurstBytes),   //读取还能再发送多少字节
+                     static_cast<long long>(bucket.tokens) + add);
+                  bucket.lastRefill = now;
+               }
+               tokens = bucket.tokens;
             }
-            file      = it->second.file;             // 拷一份 shared_ptr，锁外期间保活
-            offset    = it->second.offset;
-            remaining = it->second.remaining;
          }
 
+         if(gone){
+            finishOnce(fd);
+            return ;
+         }
+
+            // 额度为 0：不 arm EPOLLOUT，交给 sweep 唤醒（否则忙等打满 CPU）
+         if(tokens == 0){
+            saveSendFileProgress(fd, offset, remaining, 0, true);
+            finishOnce(fd);          // throttled → 内部 arm EPOLLIN
+            return;
+         }
+
+         const size_t toSend = std::min(remaining, tokens);
          ssize_t n;
          do{
-            n = ::sendfile(fd, file->fd, &offset, remaining);
+            n = ::sendfile(fd, file->fd, &offset, toSend);
          }while(n < 0 && errno == EINTR);            // 被信号打断就重试
 
          if(n < 0){
             if(errno == EAGAIN || errno == EWOULDBLOCK){
                // 内核发送缓冲区满 —— 完全正常，记住进度等 EPOLLOUT
-               saveSendFileProgress(fd, offset, remaining);
+               saveSendFileProgress(fd, offset, remaining, tokens, false);
                finishOnce(fd);
                return;
             }
@@ -1026,12 +1330,15 @@
          }
 
           remaining -= static_cast<size_t>(n);
+          tokens    -= static_cast<size_t>(n);
 
          if(remaining == 0){
             // 发完了：先摘表（FileFdOwner 析构 → close(fileFd)），再看要不要关连接
             bool closing = false;
             {
                std::lock_guard<std::mutex> lk(connMutex_);
+               auto bt = sendBuckets_.find(fd);
+               if(bt != sendBuckets_.end()) bt->second.tokens = tokens;
                sendFileStates_.erase(fd);
                auto it = closeAfterWrite_.find(fd);
                if(it != closeAfterWrite_.end()){ closeAfterWrite_.erase(it); closing = true; }
@@ -1040,18 +1347,27 @@
             else        finishOnce(fd);
             return;
          }
+            // 额度用完但文件没发完 → 标记暂停，sweep 到点唤醒
+         if(tokens == 0){
+            saveSendFileProgress(fd, offset, remaining, 0, true);
+            finishOnce(fd);
+            return;
+         }
 
-         saveSendFileProgress(fd, offset, remaining);
+         saveSendFileProgress(fd, offset, remaining, tokens, false);
          finishOnce(fd);                             // 还有剩 → arm EPOLLOUT
       }
 
-      void HTTPServer::saveSendFileProgress(int fd, off_t offset, size_t remaining){ //没写完的存回去记录
+      void HTTPServer::saveSendFileProgress(int fd, off_t offset, size_t remaining, size_t tokens, bool throttled){ //没写完的存回去记录
          std::lock_guard<std::mutex> lk(connMutex_);
          auto it = sendFileStates_.find(fd);
-         if(it != sendFileStates_.end()){
-            it->second.offset    = offset;
-            it->second.remaining = remaining;
-         }
+         if(it == sendFileStates_.end()) return;
+         it->second.offset    = offset;
+         it->second.remaining = remaining;
+         it->second.throttled = throttled;
+
+         auto bt = sendBuckets_.find(fd);
+         if(bt != sendBuckets_.end()) bt->second.tokens = tokens;
       }
 
       bool HTTPServer::writeAllToDisk(int fd, const char* data, size_t len){  //把数据写入磁盘
@@ -1116,6 +1432,313 @@
             return -1;
          }
       }
+
+      bool HTTPServer::handleCreateRelease(int fd, const std::string& request, bool keepAlive){  //绑定上传的文件和产品和版本号
+         auto fail = [&](int code, const std::string& err) -> bool{ //统一发失败响应的函数
+            nlohmann::ordered_json e;  //借用库 把json对象序列化为字符串
+            e["ok"]    = false;
+            e["error"] = err;
+            return sendResponse(fd, createResponse(e.dump(), "application/json", code, keepAlive));
+         };
+
+         const size_t headEnd = request.find("\r\n\r\n");
+         if(headEnd == std::string::npos) return fail(400, "bad request");
+         const std::string body = request.substr(headEnd + 4);
+         if(body.empty()) return fail(400, "empty body");
+
+         const nlohmann::json j = nlohmann::json::parse(body, nullptr, false);
+         if(j.is_discarded())  return fail(400, "invalid json");
+         if(!j.is_object())    return fail(400, "body must be a json object");
+
+         auto getStr = [&](const char* key) -> std::string{  //从json对象获得相对应的value
+            auto it = j.find(key);
+            if(it == j.end() || !it->is_string()) return std::string();
+            return it->get<std::string>();
+         };
+         
+         // 提取
+         const std::string productName = getStr("product_name");
+         const std::string version     = getStr("version");
+         const std::string sha         = getStr("sha256");
+         const std::string note        = getStr("note");
+         const std::string ch          = getStr("channel");
+         const std::string channel     = ch.empty() ? "beta" : ch;
+
+         //校验
+         if(productName.empty()) return fail(400, "product_name required");
+         if(version.empty())     return fail(400, "version required");
+         if(sha.size() != 64)    return fail(400, "sha256 must be 64 hex chars");
+         for(char c : sha){
+            if(!std::isxdigit(static_cast<unsigned char>(c)))
+               return fail(400, "sha256 must be 64 hex chars");
+         }
+
+         // 列宽对齐：varchar(N) 限制的是字符数不是字节数，utf8mb4 下一个汉字占 3 字节，
+         // 直接比 size() 会把 22 个汉字的合法产品名误杀。所以按 UTF-8 首字节计数。
+         // 不校验的后果：严格模式下 INSERT 报 1406，用户拿到 500，实际上是他的参数太长（400）。
+         auto charCount = [](const std::string& s) -> std::size_t{
+            std::size_t n = 0;
+            for(unsigned char c : s){
+               if((c & 0xC0) != 0x80) ++n;   // 多字节序列里只有首字节不是 10xxxxxx
+            }
+            return n;
+         };
+         if(charCount(productName) > 64)  return fail(400, "product_name too long (max 64 chars)");
+         if(channel.size()        > 16)   return fail(400, "channel too long (max 16 chars)");
+         if(charCount(note)       > 255)  return fail(400, "note too long (max 255 chars)");
+         
+         int va = 0;
+         int vb = 0;
+         int vc = 0;
+         int consumed = 0;
+         if(version.size() > 15
+         || std::sscanf(version.c_str(), "%d.%d.%d%n", &va, &vb, &vc, &consumed) != 3
+         || consumed != static_cast<int>(version.size()))   //将version拆分为三个整数
+            return fail(400, "version must be x.y.z");  
+         if(va < 0 || vb < 0 || vc < 0 || va > 999 || vb > 999 || vc > 999)
+            return fail(400, "version segment must be 0-999");
+
+         MySQLClient& db = mysqlClient();
+         const std::string escSha = db.escape(sha);  //安全化
+
+         ResultSet rs;
+         const std::string q = "SELECT id, size, ext FROM files WHERE sha256='"
+                           + escSha + "' LIMIT 1";
+         if(!db.select(q, rs)) return fail(500, "db error");
+         if(rs.empty())        return fail(404, "content not found");
+
+         //读取对应的文件信息
+         long long fileId   = 0;
+         long long fileSize = 0;
+         if(!parseInto(rs[0].at(0), fileId))   return fail(500, "bad file row");
+         if(!parseInto(rs[0].at(1), fileSize)) return fail(500, "bad file row");
+
+         const std::string ext = rs[0].at(2);
+
+         //插入releases表，已存在就更新
+      const std::string sql =
+         "INSERT INTO releases "
+         "(product_name, version, channel, file_id, sha256, size, ext, sort_key, note) VALUES ('"
+         + db.escape(productName)   + "','"
+         + db.escape(version)       + "','"
+         + db.escape(channel)       + "',"
+         + std::to_string(fileId)   + ",'"
+         + escSha                   + "',"
+         + std::to_string(fileSize) + ",'"
+         + db.escape(ext)           + "','"
+         + makeSortKey(va, vb, vc)  + "','"
+         + db.escape(note)          + "') AS new "
+         "ON DUPLICATE KEY UPDATE file_id=new.file_id, sha256=new.sha256, "
+         "size=new.size, ext=new.ext, sort_key=new.sort_key, "
+         "note=IF(new.note='', releases.note, new.note)";
+
+      // 只执行一次：再 execute 一遍值没变，affectedRows() 会变 0，n 就失去意义
+      if(!db.execute(sql)){
+         std::cerr << "登记失败: " << db.errorText() << std::endl;
+         return fail(500, "insert failed");
+      }
+      const auto n = db.affectedRows();               // 1=新建 2=覆盖 0=无变化
+
+      nlohmann::ordered_json out;
+      out["ok"]      = true;
+      out["result"]  = (n == 1) ? "created" : (n == 2) ? "updated" : "unchanged";
+      out["product"] = productName;
+      out["version"] = version;
+      out["channel"] = channel;
+
+      return sendResponse(fd,
+         createResponse(out.dump(), "application/json", 200, keepAlive));
+      }
+
+      bool HTTPServer::handleListReleases(int fd, const std::string& query, bool keepAlive){  //验参 → 拼 SQL → 查库 → 转 JSON → 发响应
+         auto fail = [&](int code, const std::string& err) -> bool{
+            nlohmann::ordered_json e;
+            e["ok"]    = false;
+            e["error"] = err;
+            return sendResponse(fd, createResponse(e.dump(), "application/json", code, keepAlive));
+         };
+
+         // ── 1. product_name 必填，query 里的中文是 percent-encoded 的（'+' 当空格）
+         std::string rawProduct;
+         if(!queryGet(query, "product_name", rawProduct))
+            return fail(400, "product_name required");
+
+         std::string productName;
+         if(!urlDecodeQuery(rawProduct, productName) || productName.empty())
+            return fail(400, "product_name invalid");
+
+         // ── 2. sort=version 走版本序，其余走时间序。order 两个取值都是字面量，不可注入
+         std::string sort;
+         queryGet(query, "sort", sort);
+         const std::string order = (sort == "version") ? "sort_key DESC, id DESC"
+                                                      : "updated_at DESC, id DESC";
+
+         // ── 3. 分页：limit 默认 20 上限 100。parseInto 失败时会留下半截结果，
+         //    所以先接临时变量，成功才覆盖默认值
+         long long limit  = 20;
+         long long offset = 0;
+         long long v = 0;
+         std::string s;
+         if(queryGet(query, "limit",  s) && parseInto(s, v)) limit  = v;
+         v = 0;
+         if(queryGet(query, "offset", s) && parseInto(s, v)) offset = v;
+         if(limit <= 0)  limit  = 20;
+         if(limit > 100) limit  = 100;
+         if(offset < 0)  offset = 0;
+
+         const std::string sql =
+            "SELECT version, channel, sha256, size, ext, note, created_at, updated_at "
+            "FROM releases WHERE product_name='" + mysqlClient().escape(productName) + "' "
+            "ORDER BY " + order +
+            " LIMIT "  + std::to_string(limit) +
+            " OFFSET " + std::to_string(offset);
+
+         ResultSet rs;
+         if(!mysqlClient().select(sql, rs)) return fail(500, "db error");
+
+         const int vi  = rs.indexOf("version");
+         const int chi = rs.indexOf("channel");
+         const int shi = rs.indexOf("sha256");
+         const int si  = rs.indexOf("size");
+         const int ei  = rs.indexOf("ext");
+         const int ni  = rs.indexOf("note");
+         const int cai = rs.indexOf("created_at");
+         const int upi = rs.indexOf("updated_at");
+         if(vi < 0 || chi < 0 || shi < 0 || si < 0 ||
+            ei < 0 || ni < 0 || cai < 0 || upi < 0){
+            return fail(500, "bad columns");
+         }
+
+         // ── 4. size 用 parseInto 不用 stoll：解析失败退化成 0，不抛异常
+         nlohmann::ordered_json items = nlohmann::ordered_json::array();
+         for(size_t i = 0; i < rs.size(); ++i){
+            const Row& r = rs[i];
+            long long oneSize = 0;
+            parseInto(r.at(si), oneSize);
+
+            nlohmann::ordered_json it;
+            it["version"]    = r.at(vi);
+            it["channel"]    = r.at(chi);
+            it["size"]       = oneSize;
+            it["note"]       = r.at(ni);
+            it["created_at"] = r.at(cai);
+            it["updated_at"] = r.at(upi);
+            it["url"]        = "/download/apps/" + r.at(shi) + r.at(ei);
+            // 与前端 pkgURL() 同一套规则：只有非 beta 才带 channel，
+            // 否则 pkg 链接会落到后端默认的 beta 上，prod 的版本必然 404
+            it["pkg"]        = "/pkg/" + productName + "/" + r.at(vi)
+                             + (r.at(chi) == "beta" ? "" : "?channel=" + r.at(chi));
+            items.push_back(std::move(it));
+         }
+
+         nlohmann::ordered_json out;
+         out["ok"]      = true;
+         out["product"] = productName;
+         out["limit"]   = limit;
+         out["offset"]  = offset;
+         out["items"]   = std::move(items);
+
+         // dump 带 replace：productName 来自 URL，可能不是合法 UTF-8
+         return sendResponse(fd,
+            createResponse(out.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace),
+                           "application/json", 200, keepAlive));
+      }
+
+
+      void HTTPServer::handlePkg(int fd, const std::string& userPath, const std::string& query, bool keepAlive){  //处理pkg(携带版本名称的访问)，然后查表得到下载地址 返回302临时重定向
+         // /pkg/<product_name>/<version>?channel=prod
+         // userPath 在 processRequest 里已经被 '?' 截断过一次，查询串只能从 query 拿。
+         // 早期版本在这里 rest.find('?') 恒为 npos，channel 永远退化成 beta —— 那段分支是死代码。
+         std::string rest = userPath.substr(5);
+
+         std::string channelRaw;
+         std::string channel;
+         // 查询串里 '+' 是空格，路径段里 '+' 是字面量 —— 两个 decode 函数不能互换
+         if(queryGet(query, "channel", channelRaw) && !channelRaw.empty()){
+            if(!urlDecodeQuery(channelRaw, channel)) channel.clear();
+         }
+         // 缺省 beta 必须写在 C++ 里：SQL 里没有 "DEFAULT" 这回事 —— 那是 INSERT 的语义，这里是 WHERE。
+         if(channel.empty()) channel = "beta";
+         // channel 列是 VARCHAR(16)，超长在严格模式下 execute 失败 → 500。客户端参数太长是 400，不是服务器错。
+         if(channel.size() > 16){ sendDownloadError(fd, 400, "400 Bad Request", keepAlive); return; }
+
+         size_t slash = rest.find('/');
+         if(slash == std::string::npos){ sendDownloadError(fd, 404, "404 Not Found", keepAlive); return; }
+         // 中文产品名在 URL 里是 percent-encoded 的，必须先解回来（实现见本节末尾）
+         std::string productName;
+         if(!urlDecodePath(rest.substr(0, slash), productName)){
+            sendDownloadError(fd, 400, "400 Bad Request", keepAlive);
+            return;
+         }
+         std::string version = rest.substr(slash + 1);
+         if(productName.empty() || version.empty()){ sendDownloadError(fd, 404, "404 Not Found", keepAlive); return; }
+
+         // ── 参数合法了才去占坑。限流必须在 sub#0 调（Redis 异步客户端只绑在那个 epoll 上），
+         //    所以这里和 download 路径同构：worker → sub#0 → 回线程池。
+         uint64_t gen = 0;
+         {
+            std::lock_guard<std::mutex> lk(connMutex_);
+            auto it = connGen_.find(fd);
+            if(it == connGen_.end()) return;              // 连接已经没了
+            gen = it->second;
+            pendingConn_.insert(fd);                      // 告诉 sweep：这个 fd 在等 Redis，别杀
+         }
+         const std::string ip = peerIp(fd);
+
+         subReactors_[0]->post([this, fd, gen, ip, productName, version, channel, keepAlive]{
+            // 独立桶：配额 100/50，和下载的 20/10 互不占用
+            checkRatelimit("ratelimit:pkg:" + ip, 1, kPkgRatelimitBurst, kPkgRatelimitQps,
+               [this, fd, gen, productName, version, channel, keepAlive](bool ok, long long){
+                  threadPool.enqueue([this, fd, gen, productName, version, channel, keepAlive, ok]{
+                     PendingGuard guard{this, fd, gen};
+
+                     {
+                        std::lock_guard<std::mutex> lk(connMutex_);
+                        auto it = connGen_.find(fd);
+                        if(it == connGen_.end() || it->second != gen) return;   // fd 已经复用成别的连接
+                     }
+
+                     if(!ok){
+                        // sendDownloadError 内部已经 finishOnce，这里不能再调
+                        sendDownloadError(fd, 429, "429 Too Many Requests", keepAlive);
+                        return;
+                     }
+
+                     // 这里必须查库，而且必须转义 —— product_name/version 来自 URL，用户可控
+                     std::string sql = "SELECT sha256, ext FROM releases WHERE product_name='"
+                                    + mysqlClient().escape(productName) + "' AND version='"
+                                    + mysqlClient().escape(version) + "' AND channel='"
+                                    + mysqlClient().escape(channel) + "' ORDER BY id DESC LIMIT 1";
+                     ResultSet rs;
+                     if(!mysqlClient().select(sql, rs) || rs.empty()){
+                        sendDownloadError(fd, 404, "404 Not Found", keepAlive);
+                        return;
+                     }
+                     const int si = rs.indexOf("sha256");
+                     const int ei = rs.indexOf("ext");
+                     if(si < 0 || ei < 0){ sendDownloadError(fd, 500, "500 Bad Column", keepAlive); return; }
+
+                     std::string location = "/download/apps/" + rs[0].at(si) + rs[0].at(ei);
+
+                     // 302 没有 body，不能走 createResponse（会塞 Content-Length 和正文）
+                     std::ostringstream resp;
+                     resp << "HTTP/1.1 302 Found\r\n"
+                        << "Date: " << httpDate(std::time(nullptr)) << "\r\n"
+                        << "Location: " << location << "\r\n"
+                        << "Content-Length: 0\r\n"
+                        << "Connection: " << (keepAlive ? "keep-alive" : "close") << "\r\n\r\n";
+
+                     if(!sendResponse(fd, resp.str())){
+                        closeConnection(fd);
+                        return;
+                     }
+                     finishOnce(fd);
+                  });
+               });
+         });
+      }
+
+
 
       bool HTTPServer::beginRecv(int fd, const std::string& request, std::string& buf){  //用于处理 已经处理完请求头后缓冲区里剩下的请求体并登记recvFileStates_ 
                                                                                           //  在处理完请求头后调用 
@@ -1342,14 +1965,15 @@
                sendDownloadError(fd, 500, "500 Rename Failed", false);
                return false;
             }
-            st->file->release();                          // 🔴 rename 成功之后才调；失败时留 path 让析构删临时文件
+            st->file->release();                          // rename 成功之后才调；失败时留 path 让析构删临时文件
 
             std::string sql =
-               "INSERT INTO files (sha256, name, size, mime, disk_path, ref_count) VALUES ('"
+               "INSERT INTO files (sha256, name, size, mime, ext, disk_path, ref_count) VALUES ('"
                + mysqlClient().escape(hex)          + "','"
                + mysqlClient().escape(st->fileName) + "',"
                + std::to_string(st->total)          + ",'"
                + mysqlClient().escape(st->mime)     + "','"
+               + mysqlClient().escape(ext)          + "','"
                + mysqlClient().escape(finalPath)    + "',1) "
                "ON DUPLICATE KEY UPDATE ref_count = ref_count + 1";   // ← 为什么必须带，见下面两段
             if(!mysqlClient().execute(sql)){
@@ -1366,11 +1990,19 @@
          detach();
 
          // ── 6. 回响应
-         std::ostringstream body;
-         body << "{\"ok\":true,\"sha256\":\"" << hex << "\",\"size\":" << st->total
-            << ",\"dedup\":" << (dedup ? "true" : "false")
-            << ",\"url\":\"" << relUrl << "\"}";
-         std::string resp = createResponse(body.str(), "application/json", 200, true);
+         // 整棵交给库。dump 带 replace：fileName 来自 URL，可能不是合法 UTF-8，
+         // 默认 strict 会抛 type_error.316，冒到 handleOnce 的 catch(...) 就是 500 + 断连。
+         nlohmann::ordered_json out;
+         out["ok"]     = true;
+         out["sha256"] = hex;
+         out["size"]   = st->total;
+         out["dedup"]  = dedup;
+         out["name"]   = st->fileName;
+         out["url"]    = relUrl;
+
+         std::string resp = createResponse(
+            out.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace),
+            "application/json", 200, true);
          if(!sendResponse(fd, resp)){
             closeConnection(fd);
             return false;
@@ -1378,6 +2010,68 @@
          finishOnce(fd);
          return true;
       }
+
+      HTTPServer::RangeParse HTTPServer::parseRangeSpec(const std::string& value,
+                          long long fileSize, ByteRange& out){  //解析Range 类似于Range: bytes=0-99 返回正确的end和start以及partial(是否是部分下载)
+         // 不认识的写法（"items=0-10"、长度不够）一律当没带，回整份是 RFC 允许的
+         if(value.size() < 7 || value.compare(0, 6, "bytes=") != 0) return HTTPServer::RangeParse::None;
+
+         std::string spec = value.substr(6);
+
+         // 🔴 多段（bytes=0-99,200-299）：整段忽略，回 200 整份。
+         //    只发第一段是错的 —— 响应里没有 multipart/byteranges，客户端会把
+         //    第一段当成完整文件存下来，静默残缺。
+         if(spec.find(',') != std::string::npos) return HTTPServer::RangeParse::None;
+
+         size_t dash = spec.find('-');
+         if(dash == std::string::npos) return HTTPServer::RangeParse::None;
+
+         const std::string lhs = spec.substr(0, dash);
+         const std::string rhs = spec.substr(dash + 1);
+
+         // 把 "123" 这种纯数字解析成 long long。不是纯数字就返回 -1（调用方当没带处理）
+         auto parseNum = [](const std::string& s) -> long long{
+            if(s.empty()) return -1;
+            char* endp = nullptr;
+            long long v = std::strtoll(s.c_str(), &endp, 10);  //第二个参数endp记录最后走到的位置
+            // endp 没走到串尾 = 中间有垃圾字符（"12x" / "abc"）。
+            //    不查这一下，strtoll("abc") 会返回 0，被当成 "bytes=0-" → 回 206 整份。
+            if(endp != s.c_str() + s.size()) return -1;
+            return v;
+         };
+
+         long long start = 0;
+         long long end   = fileSize - 1;
+
+         if(lhs.empty()){
+            // "bytes=-500" → 最后 500 字节（下载器探测尾部元数据时会用）
+            long long suffix = parseNum(rhs);
+            if(suffix <= 0) return RangeParse::None;
+            if(suffix > fileSize) suffix = fileSize;
+            start = fileSize - suffix;
+         }else{
+            start = parseNum(lhs);
+            if(start < 0) return RangeParse::None;
+            if(!rhs.empty()){
+               // "bytes=0-999"：要多了就截到末尾，这是 RFC 要求的
+               end = parseNum(rhs);
+               if(end < 0) return RangeParse::None;
+               if(end > fileSize - 1) end = fileSize - 1;
+            }
+            // "bytes=1000-" 的 rhs 为空，end 保持 fileSize-1，什么都不用做
+         }
+
+         //  越界不是"当没带"，必须 416。
+         //    回 200 的话 curl -C - 会报 33 退出（实测），续传直接失效。
+         if(start < 0 || start >= fileSize || end < start) return RangeParse::Unsatisfiable;
+
+         out.start   = start;
+         out.end     = end;
+         out.partial = true;
+         return RangeParse::Ok;
+      }
+
+      
                                     
 
 
@@ -1502,3 +2196,67 @@
       stop();
     }
 
+   bool HTTPServer::handleListProducts(int fd, const std::string& query, bool keepAlive){
+      auto fail = [&](int code, const std::string& err) -> bool{
+         nlohmann::ordered_json e;
+         e["ok"]    = false;
+         e["error"] = err;
+         return sendResponse(fd, createResponse(e.dump(), "application/json", code, keepAlive));
+      };
+
+      // ── 1. 分页：limit 默认 20 上限 100，offset 默认 0
+      long long limit  = 20;
+      long long offset = 0;
+      long long v = 0;
+      std::string sv;
+      if(queryGet(query, "limit",  sv) && parseInto(sv, v)) limit  = v;
+      v = 0;
+      if(queryGet(query, "offset", sv) && parseInto(sv, v)) offset = v;
+      if(limit <= 0)  limit  = 20;
+      if(limit > 100) limit  = 100;
+      if(offset < 0)  offset = 0;
+
+      // ── 2. 产品不是独立表，只是 releases 里的一个维度，GROUP BY 派生即可。
+      //    uk(product_name, version, channel) 的最左前缀正好能支撑 GROUP BY。
+      //    ORDER BY 后面必须补 product_name：同一秒更新的两个产品只按时间排是不稳的。
+      const std::string sql =
+         "SELECT product_name, COUNT(*) AS release_count, MAX(updated_at) AS updated_at "
+         "FROM releases GROUP BY product_name "
+         "ORDER BY updated_at DESC, product_name "
+         "LIMIT "  + std::to_string(limit) +
+         " OFFSET " + std::to_string(offset);
+
+      ResultSet rs;
+      if(!mysqlClient().select(sql, rs)) return fail(500, "db error");
+
+      const int pi = rs.indexOf("product_name");
+      const int ci = rs.indexOf("release_count");
+      const int ui = rs.indexOf("updated_at");
+      if(pi < 0 || ci < 0 || ui < 0) return fail(500, "bad columns");
+
+      nlohmann::ordered_json items = nlohmann::ordered_json::array();
+      for(size_t i = 0; i < rs.size(); ++i){
+         const Row& r = rs[i];
+         long long cnt = 0;
+         parseInto(r.at(ci), cnt);
+
+         nlohmann::ordered_json it;
+         it["product_name"]  = r.at(pi);
+         it["release_count"] = cnt;
+         it["updated_at"]    = r.at(ui);
+         // 产品名可能含中文/空格，这里不做 percent-encode，
+         // 浏览器和 curl 都会自己处理；要严谨的前端请再 encodeURIComponent 一次
+         it["url"]           = "/api/releases?product_name=" + r.at(pi);
+         items.push_back(std::move(it));
+      }
+
+      nlohmann::ordered_json out;
+      out["ok"]     = true;
+      out["limit"]  = limit;
+      out["offset"] = offset;
+      out["items"]  = std::move(items);
+
+      return sendResponse(fd,
+         createResponse(out.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace),
+                        "application/json", 200, keepAlive));
+   }

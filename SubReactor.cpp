@@ -1,4 +1,5 @@
 #include "SubReactor.h"
+#include "NetUtil.h"
 
 #include <cerrno>
 #include <utility>
@@ -114,6 +115,11 @@ void SubReactor::loop()
 
 bool SubReactor::addConnection(int fd)
 {
+    if(!setFdNonBlocking(fd))
+    {
+        return false;
+    }
+
     if(!ctl(fd, EPOLLIN, EPOLL_CTL_ADD))
     {
         return false;

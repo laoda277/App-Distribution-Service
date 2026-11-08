@@ -1,4 +1,5 @@
 #include "EpollEngine.h"
+#include "NetUtil.h"
 
 #include <cerrno>
 #include <cstring>
@@ -26,11 +27,7 @@ EpollEngine::~EpollEngine(){
 }
 
 bool EpollEngine::setNonBlocking(int fd){
-    int flags = fcntl( fd , F_GETFL , 0 );
-    if(flags < 0){
-        return false;
-    }
-    return fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0;
+    return setFdNonBlocking(fd);
 }
 
 bool EpollEngine::createListeningSocket(int port, int backlog){

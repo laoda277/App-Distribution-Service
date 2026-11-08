@@ -8,7 +8,7 @@ MYSQL_LIBS   = $(shell mysql_config --libs)
 HIREDIS_DIR  = $(HOME)/redis-7.2.5/deps/hiredis
 
 # -I$(HIREDIS_DIR) 让 <hiredis.h> 和 <async.h> 能被找到
-CXXFLAGS = -Wall -O2 -pthread -std=c++17 -I$(HIREDIS_DIR) $(MYSQL_CFLAGS)
+CXXFLAGS = -Wall -O2 -pthread -std=c++17 -I$(HIREDIS_DIR) -Ithird_party $(MYSQL_CFLAGS)
 # 静态库全路径，避免运行时找不到 .so
 LDLIBS   = $(HIREDIS_DIR)/libhiredis.a $(MYSQL_LIBS)
 TARGET   = httpserver

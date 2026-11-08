@@ -19,6 +19,7 @@
 #include "FileCache.h"
 #include "SubReactor.h"
 #include "RedisAsyncClient.h"
+#include "AsyncLogWriter.h"
 
 
 class HTTPServer{
@@ -46,8 +47,11 @@ private:
    static constexpr std::chrono::seconds kIdleTimeout{30};
    static constexpr long long kMaxUploadSize = 2LL * 1024 * 1024 * 1024;   // 单次上传上限 2GB
    static constexpr size_t    kRecvChunk     = 64 * 1024;                  // 每次 recv 64KB
+   static constexpr size_t kSendRateBytesPerSec = 10u*1024*1024; // 单连接 10MB/s
+   static constexpr size_t kSendBurstBytes      = 12u * 1024 * 1024;  // ≥ 1 秒补量，留 20% 余量抗 tick 抖动
    std::string dirRoot = "./www";
    std::string dataRoot = "./data";    // 业务数据根
+   AsyncLogWriter logWriter_;  
    ThreadPool threadPool;
    EpollEngine epollEngine;
    MimeTypes mimeTypes;
@@ -93,11 +97,31 @@ private:
       FileFdOwner(const FileFdOwner&) = delete;
       FileFdOwner& operator=(const FileFdOwner&) = delete;
       };
+   
+   struct ByteRange{
+      long long start   = 0;
+      long long end     = 0;       // 闭区间，两端都算进去
+      bool      partial = false;   // false = 客户端没带 Range，整份发
+   };
+
+   enum class RangeParse{ None, Ok, Unsatisfiable };  //没有range，有，有但起点超过文件
+
+   RangeParse parseRangeSpec(const std::string& value,
+                           long long fileSize, ByteRange& out);
+
+
+   struct SendBucket{        // 发送桶               
+   size_t tokens = kSendBurstBytes;   //还能发多少
+   std::chrono::steady_clock::time_point lastRefill = std::chrono::steady_clock::now();  //上一次补充时间
+   };
+   std::unordered_map<int, SendBucket> sendBuckets_;    // fd → 令牌桶
+
 
    struct SendFileState{
       std::shared_ptr<FileFdOwner> file;   // 引用计数 保证引用期间不会被释放
       off_t  offset    = 0;               // 已经发出去多少字节
       size_t remaining = 0;               // 还剩多少字节
+      bool   throttled = false;                          // 额度耗尽，暂停中
    };
    std::unordered_map<int, SendFileState> sendFileStates_;   // sockfd → 发送进度
 
@@ -130,7 +154,12 @@ private:
    std::unordered_map<int, std::shared_ptr<RecvFileState>> recvFileStates_;  //socketfd->接受记录
 
 
-   enum class ReadStatus {Request, WaitMore, Closed, Error, TooLarge};
+   // Request 的含义：request 里已经是一条【完整】消息。
+   //   普通请求：请求行 + 头 + body
+   //   上传请求：只有请求行 + 头，body 原样留在 connBuffer 里交给 beginRecv 流式处理
+   // 新增的 BadRequest / PayloadTooLarge 是为了让 readRequest 能把「为什么失败」带出来，
+   // 由 handleOnce 映射成 400 / 413，不再一律 500。
+   enum class ReadStatus {Request, WaitMore, Closed, Error, TooLarge, BadRequest, PayloadTooLarge};
 
    ReadStatus readRequest(int clientSocket, std::string& connBuffer, std::string& request);
    std::string extractVersion(const std::string& request);
@@ -139,19 +168,26 @@ private:
    std::string extractHeader(const std::string& request, const std::string& name); //读请求头
    std::string createNotModified(bool keepAlive, std::time_t mtime); //拼304响应
    std::string extractPath(const std::string& request);
+   bool methodIs(const std::string& request, const std::string& method); //判断请求行的动词是不是某个方法
    std::string createResponse(const std::string& content, const std::string& contentType = "text/html", int statusCode = 200, bool keepAlive = true, 
                                           const struct timespec* mtime = nullptr);
    std::string createDownloadHeader(const std::string& contentType,
                                              long long contentLength,
                                              int statusCode, bool keepAlive,
-                                             const struct timespec* mtime = nullptr);
+                                             const struct timespec* mtime = nullptr,
+                                             long long rangeStart = -1,
+                                             long long rangeEnd = -1, 
+                                             long long totalSize = 0);
 
    void dispatchNewConnection(int clientFd);   // accept拿到fd后派发
    void dispatchReady(int fd, uint32_t events); // 就绪事件派发
    bool armOn(int epfd, int fd, uint32_t events); // 往指定 epoll 重新武装
    void removeOn(int epfd, int fd);             // 从指定 epoll 摘除
    void handleRedisEvent(uint32_t events);
-   void checkRatelimit(const std::string& ip, long long need,
+   // key 和配额由调用方给：下载防带宽、/pkg/ 防刷库，两者的桶必须分开，
+   // 否则点一次短链会吃掉两次下载配额。
+   void checkRatelimit(const std::string& key, long long need,
+                       long long capacity, long long rate,
                        std::function<void(bool ok, long long remain)> done);
 
    bool processRequest(int clientSocket, const std::string& request);
@@ -170,15 +206,19 @@ private:
       void sendDownloadError(int fd, int code, const std::string& title, bool keepAlive);
    std::string peerIp(int fd); //对端ip
    void sendDownloadFile(int fd, uint64_t gen, const std::string& diskPath,
-                                  bool keepAlive);
+                                  bool keepAlive, const ByteRange& range);
    void sendFileBody(int fd);
-   void saveSendFileProgress(int fd, off_t offset, size_t remaining);
+   void saveSendFileProgress(int fd, off_t offset, size_t remaining, size_t tokens, bool throttled);
    bool writeAllToDisk(int fd, const char* data, size_t len);
    std::string sanitizeFileName(const std::string& raw);
    std::string extensionOf(const std::string& name);
    bool isUploadRequest(const std::string& request);
    long long parseContentLength(const std::string& request);
-   void handleDownload(int fd, const std::string& userPath, bool keepAlive);
+   void handleDownload(int fd, const std::string& userPath, bool keepAlive, const std::string& rangeHeader);
+   bool handleCreateRelease(int fd, const std::string& request, bool keepAlive); //登记一个版本（POST /api/releases）
+   bool handleListReleases(int fd, const std::string& query, bool keepAlive);
+   bool handleListProducts(int fd, const std::string& query, bool keepAlive); //产品列表 GET /api/products
+   void handlePkg(int fd, const std::string& userPath, const std::string& query, bool keepAlive);
    bool beginRecv(int fd, const std::string& request, std::string& buf);
    void continueRecv(int fd);
    bool finishRecv(int fd, std::shared_ptr<RecvFileState> st);
